@@ -1,0 +1,44 @@
+# Binaries
+/xdl.exe
+/xdl
+*.exe
+*.dll
+*.so
+*.dylib
+*.syso
+
+# Build / deps
+/build/bin/
+/node_modules/
+/frontend/dist/
+/frontend/node_modules/
+/extension/.output/
+/extension/.wxt/
+/extension/node_modules/
+/extension/.keys/
+/e2e/node_modules/
+/e2e/*.png
+/e2e/*.log
+/e2e/.profiles/
+
+# Local scratch
+probe.txt
+*.tmp
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local data
+*.db
+*.xdlpart
+/tmp/
+.env
+*.pem
+*.key
+
+# Wails
+/build/windows/nsis/

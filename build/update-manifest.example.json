@@ -1,0 +1,8 @@
+{
+  "version": "0.0.5-m5",
+  "url": "https://example.com/releases/XDL-0.0.5-m5-setup.exe",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "signature": "",
+  "notes": "M5: batch import, site grab, categories, schedule pause.",
+  "published": "2026-10-17"
+}
