@@ -13,6 +13,9 @@ interface TaskTableProps {
   onReveal: (t: TaskView) => void;
   onCopy: (t: TaskView) => void;
   onRemove: (t: TaskView) => void;
+  confirmId: string | null;
+  onCancelRemove: (t: TaskView) => void;
+  onConfirmRemove: (t: TaskView) => void;
   onNew: () => void;
 }
 
@@ -29,6 +32,9 @@ export function TaskTable({
   onReveal,
   onCopy,
   onRemove,
+  confirmId,
+  onCancelRemove,
+  onConfirmRemove,
   onNew,
 }: TaskTableProps) {
   if (tasks.length === 0) {
@@ -48,6 +54,43 @@ export function TaskTable({
         const canPause = PAUSABLE.has(t.state);
         const canResume = t.state === "paused" || t.state === "failed";
         const live = LIVE.has(t.state);
+
+        if (t.id === confirmId) {
+          const running = live || t.state === "verifying";
+          return (
+            <article
+              key={t.id}
+              role="listitem"
+              className="task-card confirming"
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  onCancelRemove(t);
+                }
+              }}
+            >
+              <div className="confirm-copy">
+                <p className="confirm-title" title={displayName(t)}>
+                  移除「{displayName(t)}」？
+                </p>
+                <p className="confirm-note">
+                  {running
+                    ? "会停止正在进行的下载，已经写入的文件不会删除。"
+                    : "只从任务列表移除，已经下载的文件不会删除。"}
+                </p>
+              </div>
+              <div className="confirm-actions">
+                <button className="btn ghost compact" onClick={() => onCancelRemove(t)} autoFocus>
+                  取消
+                </button>
+                <button className="btn danger compact" onClick={() => onConfirmRemove(t)}>
+                  移除
+                </button>
+              </div>
+            </article>
+          );
+        }
+
         return (
           <article
             key={t.id}
@@ -57,6 +100,10 @@ export function TaskTable({
             onClick={() => onSelect(t.id)}
             onKeyDown={(e) => {
               if (e.key === "Enter") onSelect(t.id);
+              if (e.key === "Delete") {
+                e.preventDefault();
+                onRemove(t);
+              }
             }}
             onDoubleClick={() => t.state === "done" && onOpen(t)}
           >
@@ -78,7 +125,13 @@ export function TaskTable({
                     <Icon name="external" size={14} />
                   </button>
                 )}
-                <button className="card-action" title="移除任务" onClick={() => onRemove(t)}>
+                <button
+                  id={`remove-${t.id}`}
+                  className="card-action"
+                  title="移除任务"
+                  aria-label="移除任务"
+                  onClick={() => onRemove(t)}
+                >
                   <Icon name="x" size={14} />
                 </button>
                 <button className="card-action" title="打开所在文件夹" onClick={() => onReveal(t)}>

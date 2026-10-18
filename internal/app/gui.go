@@ -665,6 +665,8 @@ func emitEngineEvents(app *application.App, rt *Runtime, ctx context.Context) {
 				}
 			case engine.EventTaskProgress:
 				app.Event.Emit("task.progress", ev.Data)
+			case engine.EventTaskRemoved:
+				app.Event.Emit("task.removed", ev.Data)
 			}
 		}
 	}

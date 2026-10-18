@@ -7,6 +7,7 @@ type EventType string
 const (
 	EventTaskUpdated  EventType = "task.updated"
 	EventTaskProgress EventType = "task.progress"
+	EventTaskRemoved  EventType = "task.removed"
 	EventAppReady     EventType = "app.ready"
 )
 

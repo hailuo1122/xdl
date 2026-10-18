@@ -471,7 +471,11 @@ func (m *Manager) Remove(id TaskID) error {
 	if infoHash != "" && bt != nil && bt.Client() != nil {
 		bt.Client().Drop(infoHash)
 	}
-	return m.store.DeleteTask(id)
+	if err := m.store.DeleteTask(id); err != nil {
+		return err
+	}
+	m.bus.Publish(Event{Type: EventTaskRemoved, Data: map[string]string{"id": string(id)}})
+	return nil
 }
 
 // SetHold freezes starting new downloads (used by schedule pause windows).

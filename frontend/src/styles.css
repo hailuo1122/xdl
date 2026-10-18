@@ -24,6 +24,9 @@
   --ok-soft: #e8f5ee;
   --bad: #d4544a;
   --bad-soft: #fceceb;
+  --danger: #c0453c;
+  --danger-hover: #ad3b33;
+  --danger-ink: #ffffff;
   --info: #5b8def;
   --shadow: 0 16px 40px rgba(31, 35, 41, 0.12);
   --shadow-soft: 0 8px 24px rgba(31, 35, 41, 0.08);
@@ -58,6 +61,9 @@
   --ok-soft: rgba(92, 184, 138, 0.14);
   --bad: #e07068;
   --bad-soft: rgba(224, 112, 104, 0.14);
+  --danger: #e07068;
+  --danger-hover: #ec837b;
+  --danger-ink: #1a1b1e;
   --info: #6f9cf5;
   --shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
   --shadow-soft: 0 8px 24px rgba(0, 0, 0, 0.3);
@@ -551,6 +557,17 @@ select {
   font-weight: 400;
 }
 
+.btn.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--danger-ink);
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
+}
+
 .btn.compact {
   height: 31px;
   padding: 0 11px;
@@ -698,6 +715,60 @@ select {
 .task-card.selected {
   border-color: var(--accent-line);
   background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface));
+}
+
+/* 移除确认：卡片原地变成一条确认栏，不弹系统对话框 */
+.task-card.confirming {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-height: 76px;
+  border-color: color-mix(in srgb, var(--danger) 34%, var(--line));
+  background: color-mix(in srgb, var(--bad-soft) 62%, var(--surface));
+  box-shadow: inset 2px 0 0 var(--danger);
+  cursor: default;
+  animation: confirm-in 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.task-card.confirming:hover {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--line));
+  background: color-mix(in srgb, var(--bad-soft) 70%, var(--surface));
+}
+
+.confirm-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.confirm-title {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.confirm-note {
+  margin: 4px 0 0;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.confirm-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+@keyframes confirm-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
 }
 
 .card-top {

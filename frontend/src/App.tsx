@@ -51,11 +51,14 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState<TaskView | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [bootError, setBootError] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   const toastSeq = useRef(1);
+  /* 已乐观移除的 id：挡住移除过程中那一条“已暂停”事件把卡片又塞回来 */
+  const removedIds = useRef<Set<string>>(new Set());
 
   const pushToast = useCallback((kind: ToastKind, text: string) => {
     const id = toastSeq.current++;
@@ -76,7 +79,7 @@ export default function App() {
       try {
         const [st, list] = await Promise.all([api.status(), api.list()]);
         applyStatus(st);
-        setTasks(list);
+        setTasks(list.filter((t) => !removedIds.current.has(t.id)));
         setBootError("");
       } catch (err) {
         // Browser Vite preview: show sample tasks so the shell can be reviewed without Wails.
@@ -212,7 +215,8 @@ export default function App() {
 
   const refreshList = useCallback(async () => {
     try {
-      setTasks(await api.list());
+      const list = await api.list();
+      setTasks(list.filter((t) => !removedIds.current.has(t.id)));
     } catch {
       /* transient */
     }
@@ -234,6 +238,7 @@ export default function App() {
       Events.On("task.updated", (ev) => {
         const t = ev.data as TaskView;
         if (!t || !t.id) return;
+        if (removedIds.current.has(t.id)) return;
         setTasks((prev) => upsert(prev, t));
         setDetail((prev) => (prev && prev.task.id === t.id ? { ...prev, task: t } : prev));
         refreshStatus();
@@ -255,6 +260,17 @@ export default function App() {
             ? { ...prev, task: { ...prev.task, done: p.done, size: p.total || prev.task.size, speed: p.speed } }
             : prev,
         );
+      }),
+    );
+    offs.push(
+      Events.On("task.removed", (ev) => {
+        const p = ev.data as { id?: string } | undefined;
+        if (!p?.id) return;
+        removedIds.current.add(p.id);
+        setTasks((prev) => prev.filter((x) => x.id !== p.id));
+        setDetail((prev) => (prev && prev.task.id === p.id ? null : prev));
+        setSelected((prev) => (prev === p.id ? null : prev));
+        setConfirmRemove((prev) => (prev && prev.id === p.id ? null : prev));
       }),
     );
     offs.push(
@@ -507,19 +523,38 @@ export default function App() {
     [pushToast],
   );
 
+  const askRemove = useCallback((t: TaskView) => setConfirmRemove(t), []);
+
+  const cancelRemove = useCallback((t: TaskView) => {
+    setConfirmRemove(null);
+    requestAnimationFrame(() => document.getElementById(`remove-${t.id}`)?.focus());
+  }, []);
+
+  /**
+   * 乐观移除：卡片立刻消失，后端在后台删。
+   * 以前这里先 window.confirm 再 await api.remove，而 Remove 内部会等运行协程最多 2 秒，
+   * 所以运行时任务会“点一下没反应”。现在失败才回滚并提示。
+   */
   const remove = useCallback(
-    async (t: TaskView) => {
-      if (!window.confirm(`移除任务「${displayName(t)}」？已下载的文件不会被删除。`)) return;
-      try {
-        await api.remove(t.id);
-        setTasks((prev) => prev.filter((x) => x.id !== t.id));
-        if (selected === t.id) setSelected(null);
-        pushToast("success", "任务已移除");
-      } catch (err) {
+    (t: TaskView) => {
+      setConfirmRemove(null);
+      const at = tasks.findIndex((x) => x.id === t.id);
+      if (at < 0) return;
+      removedIds.current.add(t.id);
+      setTasks((prev) => prev.filter((x) => x.id !== t.id));
+      if (selected === t.id) setSelected(null);
+      void api.remove(t.id).catch((err) => {
+        removedIds.current.delete(t.id);
+        setTasks((prev) => {
+          if (prev.some((x) => x.id === t.id)) return prev;
+          const next = prev.slice();
+          next.splice(Math.max(0, Math.min(at, next.length)), 0, t);
+          return next;
+        });
         pushToast("error", errorText(err));
-      }
+      });
     },
-    [selected, pushToast],
+    [tasks, selected, pushToast],
   );
 
   const toggleSelected = useCallback(() => {
@@ -573,10 +608,15 @@ export default function App() {
       }
       if (!typing && e.key === "Escape") {
         if (showNew || showSettings) return;
+        if (confirmRemove) {
+          e.preventDefault();
+          setConfirmRemove(null);
+          return;
+        }
         setSelected(null);
       }
       if (!typing && e.code === "Space" && !e.repeat) {
-        if (showNew || showSettings || showOnboarding) return;
+        if (showNew || showSettings || showOnboarding || confirmRemove) return;
         if (selected) {
           e.preventDefault();
           toggleSelected();
@@ -585,7 +625,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [openNew, selected, showNew, showSettings, showOnboarding, toggleSelected]);
+  }, [openNew, selected, showNew, showSettings, showOnboarding, confirmRemove, toggleSelected]);
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -770,13 +810,19 @@ export default function App() {
             <TaskTable
               tasks={filtered}
               selected={selected}
-              onSelect={setSelected}
+              onSelect={(id) => {
+                setConfirmRemove((prev) => (prev && prev.id !== id ? null : prev));
+                setSelected(id);
+              }}
               onPause={pause}
               onResume={resume}
               onOpen={openFile}
               onReveal={reveal}
               onCopy={copyUrl}
-              onRemove={remove}
+              onRemove={askRemove}
+              confirmId={confirmRemove?.id ?? null}
+              onCancelRemove={cancelRemove}
+              onConfirmRemove={remove}
               onNew={() => openNew()}
             />
           )}
