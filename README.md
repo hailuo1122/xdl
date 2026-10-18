@@ -13,6 +13,8 @@
 
 `0.0.5-m5` · 公开 Beta · [MIT](./LICENSE) · [第三方声明](./THIRD_PARTY_NOTICES.md)
 
+[![Download](https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-setup.exe%20%C2%B7%2024%20MB-1A1F1D)](https://github.com/hailuo1122/xdl/releases/latest)
+
 </div>
 
 > 下载本来很简单：给个地址，文件落到硬盘。
@@ -47,6 +49,8 @@
 - **代理**：默认读环境变量（`HTTP_PROXY` 等）；任务可单独填 `http(s)://`、`socks5://` 或 `direct`。FTP 只吃 SOCKS5 或直连；BT / 磁力不走这条代理。
 
 ## 三十秒跑起来
+
+不想编译？直接下 [最新安装包](https://github.com/hailuo1122/xdl/releases/latest)（24 MB，per-user，不需要管理员）。
 
 前置：Go 1.27+、Node 24+、pnpm、WebView2（Win10/11 通常自带）。
 
