@@ -2,6 +2,8 @@ export type TakeoverMode = "smart" | "ask" | "off";
 
 export type AskChoice = "xdl" | "browser";
 
+export type SitePref = "xdl" | "browser";
+
 export interface ExtensionSettings {
   mode: TakeoverMode;
   minSize: number;
@@ -9,15 +11,33 @@ export interface ExtensionSettings {
   httpsOnly: boolean;
   mediaSniff: boolean;
   notifyFallback: boolean;
+  /** Apply bundled per-site sniff / cookie hints. */
+  siteRules: boolean;
+  /**
+   * Per-host ask memory. "xdl" skips the confirm sheet; "browser" never auto-takes.
+   * Keys are bare hostnames (example.com).
+   */
+  sitePrefs: Record<string, SitePref>;
+  /** When ask times out and XDL is online, take over instead of resuming Chrome. */
+  askTimeoutToXdl: boolean;
+  /**
+   * Show the per-link "download with XDL" badge and bulk-selection bar when
+   * hovering links that classify as files.
+   */
+  bulkSelect: boolean;
 }
 
 export const DEFAULT_SETTINGS: ExtensionSettings = {
-  mode: "ask",
-  minSize: 1024 * 1024,
+  mode: "smart",
+  minSize: 256 * 1024,
   exclude: [],
   httpsOnly: false,
   mediaSniff: true,
   notifyFallback: true,
+  siteRules: true,
+  sitePrefs: {},
+  askTimeoutToXdl: true,
+  bulkSelect: true,
 };
 
 export interface AppState {
@@ -81,7 +101,7 @@ export type BgMessage =
   | { type: "link-takeover"; url: string; pageUrl?: string; suggestedName?: string; probeSize?: boolean; force?: boolean; dir?: string }
   | { type: "browser-download"; url: string; filename?: string }
   | { type: "media.scan"; items: MediaCandidate[] }
-  | { type: "ask.answer"; notificationId: string; choice: AskChoice; dir?: string }
+  | { type: "ask.answer"; notificationId: string; choice: AskChoice; dir?: string; remember?: boolean }
   | { type: "fs.chooseDir" }
   | { type: "fs.defaultDir" }
   | { type: "media.list"; tabId?: number }
@@ -92,11 +112,26 @@ export type BgMessage =
   | { type: "task.action"; action: "pause" | "resume"; id: string }
   | { type: "repair-integration" }
   | { type: "app.start" }
+  | { type: "batch.add"; urls: string[]; pageUrl?: string; dir?: string }
+  | { type: "bulk.takeover"; urls: string[]; pageUrl?: string; dir?: string }
   | { type: "toast"; kind: "info" | "success" | "error"; text: string };
+
+export interface BatchAddResult {
+  added?: TaskInfo[];
+  skipped?: number;
+  failures?: string[];
+}
 
 export type ContentMessage =
   | { type: "state.changed"; state: ContentState }
   | { type: "media.update"; candidates: MediaCandidate[] }
   | { type: "panel.open" }
   | { type: "toast"; kind: "info" | "success" | "error"; text: string }
-  | { type: "ask.download"; notificationId: string; url: string; name: string; sizeLabel?: string; defaultDir?: string };
+  | {
+      type: "ask.download";
+      notificationId: string;
+      url: string;
+      name: string;
+      sizeLabel?: string;
+      defaultDir?: string;
+    };

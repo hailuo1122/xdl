@@ -107,6 +107,8 @@ export default function App() {
             aria2Enabled: true,
             aria2Port: 6800,
             aria2Secret: "",
+            watchClipboard: true,
+            domainConcurrency: 2,
           };
           applyStatus({
             version: "0.2.0-preview",
@@ -373,15 +375,54 @@ export default function App() {
     setShowNew(true);
   }, []);
 
+  const extractDownloadText = useCallback((raw: string): string => {
+    const text = raw.trim();
+    if (!text) return "";
+    const magnet = text.match(/magnet:\?[^\s"'<>]+/i);
+    if (magnet) return magnet[0];
+    const torrentPath = text.match(/(?:[A-Za-z]:\\|\\\\|\/).+\.torrent\b/i);
+    if (torrentPath) return torrentPath[0].replace(/^["']|["']$/g, "");
+    const url = text.match(/https?:\/\/[^\s"'<>]+/i);
+    if (url) return url[0];
+    if (/^magnet:/i.test(text) || /\.torrent$/i.test(text) || /^https?:\/\//i.test(text)) return text;
+    return "";
+  }, []);
+
   const onPaste = useCallback(async () => {
     try {
       const text = await navigator.clipboard.readText();
-      if (text?.trim()) openNew(text.trim());
+      const hit = extractDownloadText(text || "");
+      if (hit) openNew(hit);
+      else if (text?.trim()) openNew(text.trim());
       else pushToast("info", "剪贴板里没有链接");
     } catch {
       openNew();
     }
-  }, [openNew, pushToast]);
+  }, [extractDownloadText, openNew, pushToast]);
+
+  useEffect(() => {
+    if (!settings?.watchClipboard) return;
+    let last = "";
+    let alive = true;
+    const tick = async () => {
+      if (!alive || showNew || showSettings || showOnboarding || document.hidden) return;
+      try {
+        const text = await navigator.clipboard.readText();
+        const hit = extractDownloadText(text || "");
+        if (!hit || hit === last) return;
+        last = hit;
+        openNew(hit);
+        pushToast("info", "已从剪贴板识别下载链接");
+      } catch {
+        /* clipboard permission / empty */
+      }
+    };
+    const id = window.setInterval(() => void tick(), 1600);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [settings?.watchClipboard, showNew, showSettings, showOnboarding, extractDownloadText, openNew, pushToast]);
 
   const addTasks = useCallback(
     (added: TaskView[]) => {
@@ -556,10 +597,17 @@ export default function App() {
       const path = (torrent as File & { path?: string }).path;
       if (path) {
         openNew(path);
+        pushToast("success", "已识别 .torrent 文件");
         return;
       }
       pushToast("info", "请使用「新建」里的选择 .torrent 文件");
       openNew();
+      return;
+    }
+    const hit = extractDownloadText(text);
+    if (hit) {
+      openNew(hit);
+      if (/^magnet:/i.test(hit)) pushToast("success", "已识别磁力链接");
       return;
     }
     if (text.trim()) openNew(text.trim());

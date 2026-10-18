@@ -48,8 +48,15 @@ func DetectKind(rawURL string) string {
 }
 
 // Probe fetches and parses an HLS/DASH manifest, returning selectable variants.
-func Probe(ctx context.Context, rawURL string, headers http.Header) (*ProbeResult, error) {
+func Probe(ctx context.Context, rawURL string, headers http.Header, proxy string) (*ProbeResult, error) {
 	client := netx.NewProbeClient(30 * time.Second)
+	if proxy != "" {
+		var err error
+		client, err = netx.WithProxy(client, proxy)
+		if err != nil {
+			return nil, err
+		}
+	}
 	body, finalURL, err := fetchText(ctx, client, rawURL, headers)
 	if err != nil {
 		return nil, err

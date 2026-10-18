@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { AppState, ContentState, ExtensionSettings, TakeoverMode } from "../lib/types";
 import { DEFAULT_SETTINGS } from "../lib/types";
+import { BUILTIN_SITE_RULES, coveredHostCount } from "../lib/siteRules";
 
 function bg<T>(msg: unknown): Promise<T | null> {
   return new Promise((resolve) => {
@@ -178,8 +179,8 @@ export default function OptionsApp() {
           <div className="mode-grid">
             {(
               [
-                ["smart", "智能接管", "文件链接与浏览器下载自动交给 XDL，失败回退浏览器。"],
-                ["ask", "每次询问", "弹出确认：选 XDL 或浏览器，并可更改保存位置。"],
+                ["smart", "智能接管", "推荐。文件链接和浏览器下载直接交给 XDL，失败才回退浏览器。"],
+                ["ask", "每次询问", "先弹出确认。勾选「记住本站」后同一网站不再问。超时且 XDL 在线时默认交给 XDL。"],
                 ["off", "关闭", "完全不碰浏览器下载；仍可右键手动使用 XDL。"],
               ] as [TakeoverMode, string, string][]
             ).map(([mode, title, desc]) => (
@@ -209,6 +210,17 @@ export default function OptionsApp() {
                 <em>MB</em>
               </div>
               <small>自动点击会先探测大小，小于该值交给浏览器；大小未知时接管。右键/媒体面板等手动操作不受限制。</small>
+            </label>
+            <label className="field">
+              <span>询问超时交给 XDL</span>
+              <button
+                type="button"
+                className={`switch ${draft.askTimeoutToXdl !== false ? "on" : ""}`}
+                onClick={() => patch({ askTimeoutToXdl: !draft.askTimeoutToXdl })}
+              >
+                <i />
+              </button>
+              <small>仅「每次询问」生效。关掉后，超时会交回浏览器继续下。</small>
             </label>
             <label className="field">
               <span>仅接管 HTTPS</span>
@@ -256,6 +268,21 @@ export default function OptionsApp() {
           </div>
           <div className="toggle-row">
             <div>
+              <span>批量选择浮层</span>
+              <small>
+                鼠标悬停文件链接时显示「用 XDL 下载」标记，可多选后一次性批量下载。
+              </small>
+            </div>
+            <button
+              type="button"
+              className={`switch ${draft.bulkSelect !== false ? "on" : ""}`}
+              onClick={() => patch({ bulkSelect: draft.bulkSelect === false })}
+            >
+              <i />
+            </button>
+          </div>
+          <div className="toggle-row">
+            <div>
               <span>接管失败时通知</span>
               <small>XDL 未响应或拒绝任务时，用系统通知告知并继续浏览器下载。</small>
             </div>
@@ -267,8 +294,38 @@ export default function OptionsApp() {
               <i />
             </button>
           </div>
+          <div className="toggle-row">
+            <div>
+              <span>站点规则包</span>
+              <small>内置 CDN / 常见视频站嗅探提示；部分站点关闭自动接管（仍可右键/面板手动发送）。</small>
+            </div>
+            <button
+              type="button"
+              className={`switch ${draft.siteRules !== false ? "on" : ""}`}
+              onClick={() => patch({ siteRules: !draft.siteRules })}
+            >
+              <i />
+            </button>
+          </div>
           <div className="note">
-            支持直链 MP4 / WebM / 音频，以及 HLS / DASH VOD（AES-128 可解密；DRM / 直播会明确拒绝）。
+            支持直链 MP4 / WebM / MKV / 音频，HLS / DASH VOD，以及 MPEG-TS HLS 直播录制（DRM / SAMPLE-AES 仍会拒绝）。
+          </div>
+
+          <div className="coverage">
+            <h3>站点规则（{coveredHostCount()} 个域名）</h3>
+            <p className="coverage-hint">
+              这些站点已内置嗅探提示。未列出的站点仍会按通用规则识别 m3u8 / mpd / mp4；
+              带「不自动接管」标记的站点只接受右键或媒体面板手动发送，避免误抢播放器请求。
+            </p>
+            <div className="coverage-grid">
+              {BUILTIN_SITE_RULES.filter((r) => r.label).map((r) => (
+                <div className="coverage-item" key={r.id}>
+                  <span className="coverage-name">{r.label}</span>
+                  <span className="coverage-host">{r.hosts.slice(0, 2).join("、")}</span>
+                  {r.noAutoTakeover && <span className="tag">手动</span>}
+                </div>
+              ))}
+            </div>
           </div>
         </section>
 

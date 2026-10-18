@@ -1,0 +1,986 @@
+/* ==========================================================================
+   XDL 安装器 · 一块冷钢面板：浅色机身 + 一条整幅的传输槽
+   按 800×520 的 WebView2 窗口设计；--u 让整块面板随窗口等比缩放
+   ========================================================================== */
+
+:root {
+  /* 六个命名色 */
+  --stone: #e4e6e0; /* 冷石：整块机身 */
+  --frost: #f5f6f2; /* 霜白：读数面、按键 */
+  --graphite: #1a1f1d; /* 石墨：主墨色，偏绿的黑 */
+  --slate: #5b645f; /* 钢灰：次要文字、刻度 */
+  --jade: #24705a; /* 青绿：链路接通、进度 */
+  --brass: #9a5b2c; /* 铜：只给 logo 的第二枚箭头、故障刻度 */
+
+  /* 由上面几支派生 */
+  --hairline: rgba(26, 31, 29, 0.16);
+  --deck-hi: #1b211f;
+  --deck: #121716;
+  --deck-text: #e9ece5;
+  --deck-dim: #98a29b;
+  --deck-line: rgba(233, 236, 229, 0.12);
+  --jade-lit: #5fc3a6;
+  --brass-lit: #c98a52;
+
+  /* 比例尺：800×520 时 u = 8px */
+  --u: min(1vw, 1.6vh);
+  --pad: clamp(24px, calc(var(--u) * 3.6), 38px);
+  --bay: calc(var(--pad) + var(--u) * 19.6);
+
+  --sans: 'IBM Plex Sans', 'DengXian', '等线', 'Microsoft YaHei UI', 'Microsoft YaHei',
+    'PingFang SC', sans-serif;
+  --mono: 'IBM Plex Mono', 'Cascadia Mono', Consolas, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  color-scheme: light;
+  background: var(--stone);
+  color: var(--graphite);
+  font-family: var(--sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+::selection {
+  background: rgba(95, 195, 166, 0.28);
+}
+
+:focus-visible {
+  outline: 2px solid var(--jade);
+  outline-offset: 3px;
+}
+
+.deck :focus-visible {
+  outline-color: var(--jade-lit);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --------------------------------------------------------------- 机身 */
+
+.app {
+  position: relative;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 470px;
+  max-width: 1120px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  overflow: hidden;
+  border-inline: 1px solid rgba(26, 31, 29, 0.05);
+  background:
+    radial-gradient(90% 72% at 4% -12%, #fbfcf8 0%, rgba(251, 252, 248, 0) 58%),
+    radial-gradient(74% 54% at 102% 0%, rgba(95, 195, 166, 0.06) 0%, rgba(95, 195, 166, 0) 60%),
+    linear-gradient(178deg, #e9ebe5 0%, var(--stone) 46%, #d9ddd6 100%);
+}
+
+/* 颗粒：只在暗处看得出来，不往脸上糊 */
+.app::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+  opacity: 0.6;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.86' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.3 0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* 边缘刻度：像量具的刻度边，不是装饰花边 */
+.ruler {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 5px;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(
+    90deg,
+    rgba(26, 31, 29, 0.3) 0 1px,
+    transparent 1px 9px
+  );
+  opacity: 0.42;
+  -webkit-mask-image: linear-gradient(90deg, #000 0%, #000 48%, transparent 88%);
+  mask-image: linear-gradient(90deg, #000 0%, #000 48%, transparent 88%);
+}
+
+.ruler-l {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  left: 0;
+  width: 5px;
+  height: 54%;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(
+    180deg,
+    rgba(26, 31, 29, 0.3) 0 1px,
+    transparent 1px 9px
+  );
+  opacity: 0.34;
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 42%, transparent 92%);
+  mask-image: linear-gradient(180deg, #000 0%, #000 42%, transparent 92%);
+}
+
+.top {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* --------------------------------------------------------------- 抬头 */
+
+.head {
+  display: flex;
+  align-items: flex-end;
+  gap: calc(var(--u) * 2);
+  padding: calc(var(--u) * 2.4) var(--pad) 0;
+}
+
+.lockup {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--u) * 1.3);
+  flex: none;
+}
+
+.brand-mark {
+  width: calc(var(--u) * 4.5);
+  height: auto;
+  color: var(--graphite);
+  filter: drop-shadow(0 1px 0 rgba(255, 255, 255, 0.6));
+}
+
+.brand-mask {
+  display: block;
+  overflow: hidden;
+  line-height: 0.9;
+}
+
+.brand {
+  display: block;
+  font-family: var(--sans);
+  font-size: clamp(60px, calc(var(--u) * 9.4), 94px);
+  font-weight: 600;
+  line-height: 0.9;
+  letter-spacing: -0.052em;
+  color: var(--graphite);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.55);
+}
+
+.head-rule {
+  flex: 1;
+  height: 1px;
+  min-width: 20px;
+  margin-bottom: calc(var(--u) * 1.4);
+  background: var(--hairline);
+  transform-origin: left center;
+}
+
+.version {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--u) * 0.8);
+  padding-bottom: calc(var(--u) * 1.1);
+  min-width: calc(var(--u) * 6.8);
+  justify-content: flex-end;
+}
+
+.ver {
+  font-family: var(--mono);
+  font-size: clamp(11.5px, calc(var(--u) * 1.5), 12.5px);
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  color: var(--slate);
+  font-variant-numeric: tabular-nums;
+}
+
+.tag {
+  font-size: clamp(9.5px, calc(var(--u) * 1.25), 10.5px);
+  line-height: 1;
+  padding: calc(var(--u) * 0.35) calc(var(--u) * 0.6) calc(var(--u) * 0.4);
+  color: var(--jade);
+  border: 1px solid rgba(36, 112, 90, 0.32);
+  border-radius: 2px;
+  letter-spacing: 0.05em;
+}
+
+/* --------------------------------------------------------------- 正文 */
+
+.hero {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  padding: calc(var(--u) * 1.9) var(--pad) 0;
+}
+
+.hero-copy {
+  max-width: min(74vw, 560px);
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(21px, calc(var(--u) * 2.85), 28px);
+  font-weight: 400;
+  line-height: 1.34;
+  letter-spacing: 0.008em;
+}
+
+.lede {
+  margin: calc(var(--u) * 0.9) 0 0;
+  max-width: min(74vw, 560px);
+  font-size: clamp(14px, calc(var(--u) * 1.82), 16px);
+  line-height: 1.7;
+  letter-spacing: 0.012em;
+  color: var(--slate);
+  text-wrap: pretty;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.sub {
+  margin: calc(var(--u) * 0.7) 0 0;
+  max-width: min(74vw, 560px);
+  font-family: var(--mono);
+  font-size: clamp(11.5px, calc(var(--u) * 1.55), 13px);
+  line-height: 1.55;
+  color: #4b544f;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --------------------------------------------------------------- 路径槽 */
+
+.slot-row {
+  margin-top: auto;
+  padding: calc(var(--u) * 1.4) 0 calc(var(--u) * 0.9);
+}
+
+.slot {
+  position: relative;
+  display: block;
+  width: 100%;
+  max-width: min(68vw, 560px);
+  padding: calc(var(--u) * 1.2) calc(var(--u) * 11) calc(var(--u) * 1.3)
+    calc(var(--u) * 1.8);
+  text-align: left;
+  background: none;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
+  color: inherit;
+  cursor: pointer;
+  transition: background-color 0.22s ease;
+}
+
+.slot::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: -1px;
+  bottom: -1px;
+  width: 2px;
+  background: var(--graphite);
+  transition: background-color 0.22s ease;
+}
+
+.slot .k {
+  display: block;
+  font-size: clamp(11.5px, calc(var(--u) * 1.5), 12.5px);
+  line-height: 1.3;
+  letter-spacing: 0.09em;
+  color: var(--slate);
+}
+
+.slot .v {
+  display: block;
+  margin-top: calc(var(--u) * 0.45);
+  font-family: var(--mono);
+  font-size: clamp(12px, calc(var(--u) * 1.62), 13px);
+  line-height: 1.5;
+  color: var(--graphite);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.slot .chg {
+  position: absolute;
+  right: calc(var(--u) * 1.7);
+  top: 50%;
+  transform: translateY(-58%);
+  font-size: clamp(11.5px, calc(var(--u) * 1.5), 12.5px);
+  color: var(--slate);
+  padding-bottom: 1px;
+  border-bottom: 1px solid transparent;
+  transition:
+    color 0.18s ease,
+    border-color 0.18s ease;
+}
+
+.slot:hover:not(:disabled)::before {
+  background: var(--jade);
+}
+
+.slot:hover:not(:disabled) .chg {
+  color: var(--graphite);
+  border-bottom-color: var(--graphite);
+}
+
+.slot:disabled {
+  cursor: default;
+}
+
+.slot.is-dim {
+  opacity: 0.55;
+}
+
+.slot.is-dim::before {
+  background: var(--jade);
+}
+
+.slot-keep {
+  cursor: default;
+  padding-right: calc(var(--u) * 1.8);
+}
+
+.slot-keep::before {
+  background: var(--jade);
+}
+
+/* --------------------------------------------------------------- 传输槽 */
+
+.deck {
+  position: relative;
+  height: calc(var(--u) * 25.1);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--bay);
+  color: var(--deck-text);
+  background:
+    radial-gradient(120% 140% at 0% 0%, rgba(95, 195, 166, 0.06) 0%, rgba(95, 195, 166, 0) 52%),
+    linear-gradient(180deg, var(--deck-hi) 0%, var(--deck) 42%, #0d1110 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+
+.deck-lanes {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: calc(var(--u) * 2.2) var(--pad) calc(var(--u) * 2);
+}
+
+.deck-head {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--u) * 1.2);
+  height: calc(var(--u) * 2);
+  font-size: clamp(11.5px, calc(var(--u) * 1.5), 12.5px);
+  letter-spacing: 0.07em;
+  color: var(--deck-dim);
+}
+
+.deck-title {
+  letter-spacing: 0.1em;
+}
+
+.deck-head .sep {
+  width: 1px;
+  height: calc(var(--u) * 1.1);
+  background: var(--deck-line);
+}
+
+.deck-count {
+  font-size: clamp(11px, calc(var(--u) * 1.42), 12px);
+  letter-spacing: 0.04em;
+}
+
+.deck-count b {
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: clamp(11.5px, calc(var(--u) * 1.5), 12.5px);
+  color: var(--deck-text);
+}
+
+.deck-state {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--u) * 0.7);
+  color: var(--deck-text);
+  letter-spacing: 0.08em;
+}
+
+.dot {
+  width: calc(var(--u) * 0.62);
+  height: calc(var(--u) * 0.62);
+  border-radius: 50%;
+  background: var(--jade-lit);
+  box-shadow: 0 0 0 3px rgba(95, 195, 166, 0.12);
+}
+
+.deck[data-state='ready'] .dot {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px rgba(233, 236, 229, 0.42);
+}
+
+.deck[data-state='working'] .dot {
+  animation: dotPulse 1.9s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.deck[data-state='done'] .dot {
+  box-shadow: 0 0 0 4px rgba(95, 195, 166, 0.16);
+}
+
+.deck[data-state='done'] .deck-state {
+  color: var(--jade-lit);
+}
+
+.deck[data-state='error'] .deck-state {
+  color: var(--brass-lit);
+}
+
+.deck[data-state='error'] .dot {
+  background: var(--brass-lit);
+  box-shadow: 0 0 0 3px rgba(201, 138, 82, 0.14);
+}
+
+/* 轨道 */
+
+.lanes {
+  position: relative;
+  margin-top: calc(var(--u) * 1.55);
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--u) * 1.05);
+  --chunk: calc(var(--u) * 4.25);
+}
+
+.lane {
+  position: relative;
+  height: calc(var(--u) * 1.2);
+  flex: none;
+}
+
+.lane .track,
+.lane .fill,
+.lane .solid {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  display: block;
+}
+
+.track {
+  right: 0;
+  background-image: linear-gradient(
+    90deg,
+    rgba(233, 236, 229, 0.1) 0%,
+    rgba(233, 236, 229, 0.045) 58%,
+    rgba(233, 236, 229, 0.022) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.4);
+  clip-path: inset(0 100% 0 0);
+  animation: trackIn 0.68s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation-delay: calc(0.24s + var(--i) * 42ms);
+}
+
+.fill {
+  width: calc(var(--p) * 100%);
+  background: linear-gradient(
+    90deg,
+    rgba(38, 116, 97, 0.5) 0%,
+    rgba(52, 146, 122, 0.58) 55%,
+    rgba(104, 204, 174, 0.72) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(214, 255, 242, 0.16),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.16);
+  transition:
+    width 0.54s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.3s ease;
+  transition-delay: var(--d, 0ms);
+}
+
+.solid {
+  width: calc(var(--p) * 100%);
+  background: linear-gradient(180deg, #4a9a83 0%, #2c6657 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(206, 255, 240, 0.18),
+    0 0 14px rgba(95, 195, 166, 0.08);
+  opacity: 0;
+  transition:
+    opacity 0.46s ease,
+    width 0.54s cubic-bezier(0.22, 1, 0.36, 1);
+  transition-delay: var(--d, 0ms);
+}
+
+.deck[data-state='done'] .fill {
+  opacity: 0;
+}
+
+.deck[data-state='done'] .solid {
+  opacity: 1;
+}
+
+.deck[data-state='error'] .fill {
+  opacity: 0.42;
+  filter: grayscale(0.9);
+}
+
+.deck[data-mode='install'][data-state='ready'] .fill {
+  width: 6px;
+  opacity: 0.62;
+  background: linear-gradient(180deg, rgba(163, 240, 215, 0.85), rgba(70, 170, 143, 0.75));
+  box-shadow: 0 0 9px rgba(95, 195, 166, 0.3);
+}
+
+.deck[data-mode='uninstall'][data-state='ready'] .fill {
+  width: calc(var(--p) * 100%);
+  opacity: 0.26;
+  background: linear-gradient(180deg, #4a9a83 0%, #2c6657 100%);
+  box-shadow: none;
+}
+
+/* 推进端的一点光 */
+.tipwrap {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: calc(var(--p) * 100%);
+  pointer-events: none;
+  transition: width 0.54s cubic-bezier(0.22, 1, 0.36, 1);
+  transition-delay: var(--d, 0ms);
+}
+
+.tipwrap::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: -3px;
+  bottom: -3px;
+  width: 1px;
+  background: rgba(200, 255, 238, 0.62);
+  box-shadow: 0 0 8px 1px rgba(95, 195, 166, 0.35);
+  opacity: 0;
+  transition: opacity 0.28s ease;
+}
+
+.deck[data-state='working'] .tipwrap::after {
+  opacity: 0.9;
+}
+
+/* 待命时的巡检：一条很淡的光从通道里走过去 */
+.ping {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+}
+
+.deck[data-state='ready'] .ping {
+  opacity: 1;
+}
+
+.ping i {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  left: 0;
+  width: calc(var(--u) * 15);
+  display: block;
+  background: linear-gradient(
+    90deg,
+    rgba(95, 195, 166, 0) 0%,
+    rgba(95, 195, 166, 0.16) 46%,
+    rgba(95, 195, 166, 0.28) 52%,
+    rgba(95, 195, 166, 0.16) 58%,
+    rgba(95, 195, 166, 0) 100%
+  );
+  transform: translateX(calc(var(--u) * -15));
+  animation: pingMove 6.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  animation-delay: calc(var(--i) * 0.11s);
+}
+
+/* 安装中：一层很轻的光扫过整排 */
+.lanes::before {
+  content: '';
+  position: absolute;
+  z-index: 2;
+  inset: -5px 0;
+  pointer-events: none;
+  opacity: 0;
+  background-image: linear-gradient(
+    100deg,
+    rgba(233, 236, 229, 0) 0%,
+    rgba(233, 236, 229, 0.05) 42%,
+    rgba(233, 236, 229, 0.1) 50%,
+    rgba(233, 236, 229, 0.05) 58%,
+    rgba(233, 236, 229, 0) 100%
+  );
+  background-size: calc(var(--u) * 28) 100%;
+  background-repeat: no-repeat;
+  background-position: calc(var(--u) * -28) 0;
+}
+
+/* 运行时的模数刻线 */
+.deck[data-state='working'] .track,
+.deck[data-state='error'] .track {
+  background-image:
+    repeating-linear-gradient(
+      90deg,
+      rgba(233, 236, 229, 0) 0 calc(var(--chunk) - 1px),
+      rgba(233, 236, 229, 0.07) calc(var(--chunk) - 1px) var(--chunk)
+    ),
+    linear-gradient(
+      90deg,
+      rgba(233, 236, 229, 0.09) 0%,
+      rgba(233, 236, 229, 0.04) 58%,
+      rgba(233, 236, 229, 0.02) 100%
+    );
+}
+
+.lanes::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: -4px;
+  bottom: -4px;
+  width: 1px;
+  background: rgba(233, 236, 229, 0.09);
+  pointer-events: none;
+}
+
+.deck[data-state='working'] .lanes::before {
+  opacity: 1;
+  animation: sheen 3.6s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+}
+
+/* 故障刻度 */
+.fault {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  left: calc(var(--p) * 100%);
+  width: 2px;
+  background: var(--brass-lit);
+  box-shadow: 0 0 12px rgba(201, 138, 82, 0.5);
+  opacity: 0;
+  animation: faultIn 0.4s ease forwards;
+  pointer-events: none;
+}
+
+.fault i {
+  position: absolute;
+  top: -3px;
+  left: -3px;
+  width: 8px;
+  height: 4px;
+  background: var(--brass-lit);
+}
+
+/* 右侧控制舱 */
+
+.bay {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 var(--pad) 0 calc(var(--u) * 1.2);
+  border-left: 1px solid var(--deck-line);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(0, 0, 0, 0.14));
+}
+
+.readout {
+  display: flex;
+  align-items: baseline;
+  gap: calc(var(--u) * 0.4);
+  font-family: var(--mono);
+  color: var(--deck-text);
+  line-height: 1;
+}
+
+.readout b {
+  font-weight: 400;
+  font-size: clamp(30px, calc(var(--u) * 4.4), 40px);
+  letter-spacing: -0.035em;
+  font-variant-numeric: tabular-nums;
+}
+
+.readout span {
+  font-size: clamp(11px, calc(var(--u) * 1.6), 13px);
+  color: var(--deck-dim);
+}
+
+.deck[data-state='error'] .readout b {
+  color: var(--brass-lit);
+}
+
+.key-well {
+  padding: calc(var(--u) * 1);
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.22);
+  box-shadow:
+    inset 0 1px 3px rgba(0, 0, 0, 0.5),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.bay-rule {
+  width: calc(var(--u) * 5.6);
+  height: 1px;
+  margin: calc(var(--u) * 1.2) 0 calc(var(--u) * 1.6);
+  background: var(--deck-line);
+}
+
+.key {
+  position: relative;
+  width: calc(var(--u) * 17.5);
+  height: calc(var(--u) * 5.8);
+  border: 0;
+  border-radius: 2px;
+  background: var(--frost);
+  color: var(--graphite);
+  font-size: clamp(13.5px, calc(var(--u) * 1.8), 15px);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  overflow: hidden;
+  box-shadow:
+    0 1px 0 rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 #ffffff,
+    0 10px 22px -12px rgba(0, 0, 0, 0.8);
+  transition:
+    transform 0.16s cubic-bezier(0.2, 0.9, 0.2, 1),
+    background-color 0.2s ease,
+    box-shadow 0.2s ease,
+    color 0.2s ease;
+}
+
+.key::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: calc(var(--k) * 100%);
+  background: var(--jade);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.deck[data-state='working'] .key::after {
+  opacity: 1;
+}
+
+.deck[data-state='error'] .key {
+  box-shadow:
+    0 1px 0 rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px rgba(201, 138, 82, 0.6),
+    0 10px 22px -12px rgba(0, 0, 0, 0.8);
+}
+
+.key:hover:not(:disabled) {
+  background: #fdfdf9;
+  transform: translateY(-1px);
+  box-shadow:
+    0 2px 0 rgba(0, 0, 0, 0.58),
+    inset 0 1px 0 #ffffff,
+    0 16px 26px -14px rgba(0, 0, 0, 0.85);
+}
+
+.key:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow:
+    0 0 0 rgba(0, 0, 0, 0.55),
+    inset 0 2px 6px rgba(26, 31, 29, 0.22);
+}
+
+.key:disabled {
+  cursor: default;
+  color: rgba(233, 236, 229, 0.56);
+  background: rgba(233, 236, 229, 0.07);
+  box-shadow: inset 0 0 0 1px rgba(233, 236, 229, 0.12);
+}
+
+.key:disabled::after {
+  opacity: 0;
+}
+
+/* 完成时从槽底亮起的一条线 */
+.seal {
+  position: absolute;
+  left: 0;
+  right: var(--bay);
+  bottom: 0;
+  height: 2px;
+  transform-origin: left center;
+  background: linear-gradient(
+    90deg,
+    rgba(95, 195, 166, 0.95) 0%,
+    rgba(95, 195, 166, 0.45) 46%,
+    rgba(95, 195, 166, 0.1) 100%
+  );
+}
+
+/* --------------------------------------------------------------- 页脚 */
+
+.foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: calc(var(--u) * 5.8);
+  padding: 0 var(--pad);
+}
+
+.note {
+  font-size: clamp(11.5px, calc(var(--u) * 1.5), 12.5px);
+  letter-spacing: 0.04em;
+  color: var(--slate);
+  opacity: 0.92;
+}
+
+.close {
+  position: relative;
+  padding: 6px 0;
+  margin-right: -1px;
+  background: none;
+  border: 0;
+  font-size: clamp(12px, calc(var(--u) * 1.55), 12.8px);
+  letter-spacing: 0.06em;
+  color: var(--slate);
+  cursor: pointer;
+  transition: color 0.18s ease;
+}
+
+.close::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 2px;
+  height: 1px;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.close:hover:not(:disabled) {
+  color: var(--graphite);
+}
+
+.close:hover:not(:disabled)::after {
+  transform: scaleX(1);
+}
+
+.close:disabled {
+  cursor: default;
+  color: rgba(91, 100, 95, 0.45);
+}
+
+/* --------------------------------------------------------------- 动效 */
+
+@keyframes trackIn {
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+@keyframes dotPulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes pingMove {
+  0% {
+    transform: translateX(calc(var(--u) * -15));
+  }
+  19% {
+    transform: translateX(calc(var(--u) * 72));
+  }
+  100% {
+    transform: translateX(calc(var(--u) * 72));
+  }
+}
+
+@keyframes sheen {
+  0% {
+    background-position: calc(var(--u) * -28) 0;
+  }
+  58%,
+  100% {
+    background-position: calc(100% + var(--u) * 3) 0;
+  }
+}
+
+@keyframes faultIn {
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+
+  .ping,
+  .lanes::before {
+    display: none;
+  }
+}

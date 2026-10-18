@@ -49,6 +49,8 @@ export const api = {
     call<TaskView | null>("FindDuplicate", url, dir, name),
   pause: (id: string) => call<void>("Pause", id),
   resume: (id: string) => call<void>("Resume", id),
+  setPriority: (id: string, priority: number) => call<void>("SetPriority", id, priority),
+  setLimitBps: (id: string, bps: number) => call<void>("SetLimitBps", id, bps),
   remove: (id: string) => call<void>("Remove", id),
   pauseAll: () => call<number>("PauseAll"),
   resumeAll: () => call<number>("ResumeAll"),

@@ -76,12 +76,12 @@ func TestSanitizeName(t *testing.T) {
 }
 
 func TestSafeURL(t *testing.T) {
-	for _, u := range []string{"http://a/b", "HTTPS://a/b", "https://a/b?x=1", "magnet:?xt=urn:btih:x"} {
+	for _, u := range []string{"http://a/b", "HTTPS://a/b", "https://a/b?x=1", "magnet:?xt=urn:btih:x", "ftp://a/b"} {
 		if !safeURL(u) {
 			t.Errorf("%q should be accepted", u)
 		}
 	}
-	for _, u := range []string{"", "file:///etc/passwd", "javascript:alert(1)", "data:text/plain,x", "ftp://a/b", "http:/short"} {
+	for _, u := range []string{"", "file:///etc/passwd", "javascript:alert(1)", "data:text/plain,x", "sftp://a/b", "http:/short"} {
 		if safeURL(u) {
 			t.Errorf("%q should be rejected", u)
 		}

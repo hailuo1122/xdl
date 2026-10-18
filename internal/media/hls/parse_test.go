@@ -44,10 +44,16 @@ func TestParseVOD(t *testing.T) {
 	}
 }
 
-func TestRejectLive(t *testing.T) {
-	_, err := ParseMedia(strings.NewReader(live))
-	if err == nil {
-		t.Fatal("expected live rejection")
+func TestParseLive(t *testing.T) {
+	m, err := ParseMedia(strings.NewReader(live))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Live || len(m.Segments) != 1 {
+		t.Fatalf("%+v", m)
+	}
+	if _, err := ParseMediaVOD(strings.NewReader(live)); err == nil {
+		t.Fatal("expected VOD helper to reject live")
 	}
 }
 

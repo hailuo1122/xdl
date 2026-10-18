@@ -185,7 +185,7 @@ func TestProbeRejectsDRM(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-	_, err := Probe(context.Background(), srv.URL+"/drm.mpd", nil)
+	_, err := Probe(context.Background(), srv.URL+"/drm.mpd", nil, "")
 	if err == nil {
 		t.Fatal("expected DRM reject")
 	}

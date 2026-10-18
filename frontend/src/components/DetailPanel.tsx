@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { api, errorText } from "../api";
 import {
   bytes,
   displayName,
@@ -12,6 +13,7 @@ import {
 import type { TaskDetail, TaskView } from "../types";
 import { ChunkMap } from "./ChunkMap";
 import { Icon } from "./Icon";
+import { Select } from "./Select";
 
 interface DetailPanelProps {
   detail: TaskDetail | null;
@@ -217,8 +219,79 @@ export function DetailPanel({
                 </>
               )}
             </div>
+            {(t.expectedSha256 || t.sha256) && (
+              <div className="validator-line" style={{ marginTop: 8 }}>
+                {t.state === "verifying" ? (
+                  <>
+                    <span className="ok-dot" />
+                    正在计算 SHA-256…
+                  </>
+                ) : t.sha256 && t.expectedSha256 && t.sha256 === t.expectedSha256 ? (
+                  <>
+                    <span className="ok-dot" />
+                    SHA-256 校验通过
+                  </>
+                ) : t.sha256 ? (
+                  <>
+                    <span className="ok-dot" />
+                    SHA-256 {t.sha256.slice(0, 12)}…
+                  </>
+                ) : (
+                  <>
+                    <span className="warn-dot" />
+                    将校验 {t.expectedSha256?.slice(0, 12)}…
+                  </>
+                )}
+              </div>
+            )}
           </div>
         )}
+
+        <div className="detail-section">
+          <div className="section-label">调度</div>
+          <div className="form-row" style={{ gap: 8, marginTop: 6 }}>
+            <label className="field" style={{ flex: 1 }}>
+              <span className="field-label">优先级</span>
+              <Select
+                aria-label="任务优先级"
+                value={t.priority ?? 0}
+                onChange={(v) => {
+                  void api
+                    .setPriority(t.id, v)
+                    .then(() => onToast("success", "优先级已更新"))
+                    .catch((err) => onToast("error", errorText(err)));
+                }}
+                options={[
+                  { value: 2, label: "高" },
+                  { value: 0, label: "普通" },
+                  { value: -1, label: "低" },
+                ]}
+              />
+            </label>
+            {t.kind !== "torrent" && (
+              <label className="field" style={{ flex: 1 }}>
+                <span className="field-label">单任务限速</span>
+                <Select
+                  aria-label="单任务限速"
+                  value={t.limitBps ?? 0}
+                  onChange={(v) => {
+                    void api
+                      .setLimitBps(t.id, v)
+                      .then(() => onToast("success", "限速已更新"))
+                      .catch((err) => onToast("error", errorText(err)));
+                  }}
+                  options={[
+                    { value: 0, label: "不限速" },
+                    { value: 512 * 1024, label: "512 KB/s" },
+                    { value: 1 << 20, label: "1 MB/s" },
+                    { value: 3 << 20, label: "3 MB/s" },
+                    { value: 5 << 20, label: "5 MB/s" },
+                  ]}
+                />
+              </label>
+            )}
+          </div>
+        </div>
 
         <div className="detail-actions">
           {active && (

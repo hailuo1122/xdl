@@ -20,6 +20,8 @@ type Meta struct {
 	SegDone    []bool   `json:"segDone,omitempty"`
 	InitDone   bool     `json:"initDone,omitempty"`
 	AudioDone  []bool   `json:"audioDone,omitempty"`
+	Live       bool     `json:"live,omitempty"`
+	LiveMode   string   `json:"liveMode,omitempty"` // record | ""
 }
 
 func EncodeMeta(m Meta) (json.RawMessage, error) {

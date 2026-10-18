@@ -351,6 +351,74 @@ button:disabled {
   line-height: 1.7;
 }
 
+/* site rule coverage list */
+
+.coverage {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.coverage h3 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+.coverage-hint {
+  margin: 6px 0 10px;
+  font-size: 10.2px;
+  line-height: 1.7;
+  color: var(--text-3);
+}
+
+.coverage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 6px;
+}
+
+.coverage-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  min-width: 0;
+}
+
+.coverage-name {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coverage-host {
+  font-size: 9px;
+  font-family: var(--mono);
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.coverage-item .tag {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  color: var(--text-3);
+  font-size: 8.5px;
+}
+
 /* integration */
 
 .integration-state {

@@ -1,9 +1,9 @@
-import { DEFAULT_SETTINGS, type AppState, type AskChoice, type BgMessage, type ContentState, type ExtensionSettings, type MediaCandidate, type TakeoverResult, type TaskInfo } from "../lib/types";
-import { isExcluded, loadSettings, saveSettings, settingsFromStorageValue } from "../lib/settings";
+import { DEFAULT_SETTINGS, type AppState, type AskChoice, type BatchAddResult, type BgMessage, type ContentState, type ExtensionSettings, type MediaCandidate, type TakeoverResult, type TaskInfo } from "../lib/types";
+import { isExcluded, loadSettings, saveSettings, settingsFromStorageValue, sitePrefFor } from "../lib/settings";
 import { XDLError, nativeCall, pingApp } from "../lib/native";
 import {
   baseName,
-  captureRequestHeaders,
+  classifyLink,
   cookieHeaderFor,
   extOf,
   formatBytes,
@@ -14,6 +14,18 @@ import {
   mediaCandidate,
   mediaKindFor,
 } from "../lib/context";
+import {
+  clearPausedByUs,
+  isRecentlySubmitted,
+  markConsidered,
+  markPausedByUs,
+  markSubmitted,
+  putCapture as captureRequestHeaders,
+  restoreAll,
+  restorePaused,
+  unmarkConsidered,
+} from "../lib/swstate";
+import { ruleHintsFor } from "../lib/siteRules";
 
 const ICON_URL = () => chrome.runtime.getURL("icon/128.png");
 
@@ -21,14 +33,15 @@ let currentSettings: ExtensionSettings = { ...DEFAULT_SETTINGS };
 let appState: AppState = { hostPresent: null, appOnline: false, checkedAt: 0 };
 let ready: Promise<void> = Promise.resolve();
 
-const consideredDownloads = new Set<number>();
-const recentSubmitted = new Map<string, number>();
 const mediaByTab = new Map<number, MediaCandidate[]>();
 const mediaLoaded = new Set<number>();
 const askPending = new Map<string, AskPending>();
 
 const ASK_STORAGE_KEY = "xdl.ask.pending";
-const ASK_TIMEOUT_MS = 45000;
+const ASK_TIMEOUT_MS = 28000;
+
+/** Heartbeat period. Comfortably under Chrome's 30s idle termination. */
+const KEEPALIVE_PERIOD_S = 20;
 
 interface AskPending {
   notificationId: string;
@@ -150,12 +163,14 @@ async function maybeRefreshAppState(maxAgeMs = 60000): Promise<AppState> {
 }
 
 /**
- * Best-effort HEAD used only to honor the size threshold before automatic
- * click takeover. Cookies are attached by the browser (host permission);
- * Authorization is forwarded from the observed request. Any failure means
- * "size unknown", which allows the takeover to proceed.
+ * Best-effort verification used to confirm a "probe" link really is a file and
+ * to honour the size threshold before automatic takeover. Cookies ride along on
+ * the host permission; Authorization is replayed from the observed request.
+ *
+ * Any failure means "unknown", which lets the takeover proceed — the desktop
+ * app performs its own authoritative probe anyway.
  */
-async function probeContentSize(url: string, authorization?: string): Promise<number> {
+async function probeContent(url: string, authorization?: string): Promise<{ size: number; file: boolean }> {
   const controller = new AbortController();
   const timer = self.setTimeout(() => controller.abort(), 2500);
   try {
@@ -166,11 +181,15 @@ async function probeContentSize(url: string, authorization?: string): Promise<nu
       signal: controller.signal,
       headers: authorization ? { Authorization: authorization } : undefined,
     });
-    if (!res.ok) return 0;
+    const mime = (res.headers.get("content-type") || "").split(";")[0]?.trim() || "";
     const n = Number(res.headers.get("content-length") || 0);
-    return Number.isFinite(n) && n > 0 ? n : 0;
+    const size = Number.isFinite(n) && n > 0 ? n : 0;
+    // A definitive page MIME means this was a false positive: let the browser
+    // navigate normally instead of hijacking.
+    const file = res.ok ? !isHTMLMime(mime) : true;
+    return { size, file };
   } catch {
-    return 0;
+    return { size: 0, file: true };
   } finally {
     self.clearTimeout(timer);
   }
@@ -190,13 +209,19 @@ async function submitDownload(input: {
   if (!isHTTPUrl(url)) {
     return { ok: false, code: "UNSUPPORTED_URL", error: friendlyError("UNSUPPORTED_URL", "") };
   }
-  const kind = mediaKindFor(url);
+  let kind = mediaKindFor(url);
   let host = "";
   try {
     host = new URL(url).hostname;
   } catch {
     return { ok: false, code: "UNSUPPORTED_URL", error: "链接格式不正确" };
   }
+  const hints = currentSettings.siteRules !== false
+    ? ruleHintsFor(url)
+    : { hls: false, dash: false, noAuto: false, needCookies: false, preferKind: undefined, extraExts: new Set<string>(), isStream: false, matched: [] };
+  if (!kind && hints.hls) kind = "hls";
+  if (!kind && hints.dash) kind = "dash";
+  if (!kind && hints.isStream) kind = hints.preferKind || "video";
   // Explicit actions (context menu, media panel, confirmed ask) may target an
   // excluded site. Automatic takeover never reaches this point for those.
   if (!input.force && isExcluded(host, currentSettings.exclude)) {
@@ -209,9 +234,19 @@ async function submitDownload(input: {
   const pageUrl = input.pageUrl || "";
   const cookie = await cookieHeaderFor(url, pageUrl);
   const captured = lookupCaptured(input.tabId, url);
-  if (input.probeSize && currentSettings.minSize > 0) {
-    const size = await probeContentSize(url, captured?.authorization);
-    if (size > 0 && size < currentSettings.minSize) {
+
+  // Unproven links get one cheap verification. This costs one request and
+  // removes the worst class of false positives (hijacking page navigation).
+  if (input.probeSize && kind !== "hls" && kind !== "dash") {
+    const probe = await probeContent(url, captured?.authorization);
+    if (!probe.file) {
+      return {
+        ok: false,
+        code: "NOT_A_FILE",
+        error: "",
+      };
+    }
+    if (probe.size > 0 && currentSettings.minSize > 0 && probe.size < currentSettings.minSize) {
       return {
         ok: false,
         code: "BELOW_THRESHOLD",
@@ -268,7 +303,7 @@ async function submitDownload(input: {
     if (!task?.id) {
       throw new XDLError("APP_OFFLINE", "XDL 没有接住这个任务");
     }
-    recentSubmitted.set(url, Date.now() + 12000);
+    markSubmitted(url);
     return { ok: true, task };
   } catch (err) {
     applyNativeFailure(err);
@@ -404,10 +439,26 @@ function urlHost(url: string): string {
 
 async function scheduleDownload(item: chrome.downloads.DownloadItem) {
   await ready;
-  if (consideredDownloads.has(item.id)) return;
-  consideredDownloads.add(item.id);
-  await sleep(80);
-  await processDownload(item.id);
+  // Durable ledger: survives the worker being terminated between events.
+  if (!markConsidered(item.id)) return;
+  await withKeepalive(async () => {
+    await sleep(120);
+    try {
+      await processDownload(item.id);
+    } catch (err) {
+      // Nothing above may leave a download paused on its way out.
+      await releaseDownload(item.id);
+    }
+  });
+}
+
+/**
+ * Single exit point that guarantees a download we paused is never abandoned.
+ * Called on every terminal outcome of the takeover decision.
+ */
+async function releaseDownload(id: number) {
+  await clearPausedByUs(id);
+  await resumeDownload(id).catch(() => {});
 }
 
 async function processDownload(id: number) {
@@ -419,33 +470,53 @@ async function processDownload(id: number) {
   if (!isHTTPUrl(url)) return;
   if (isHTMLMime(item.mime)) return;
   if (extOf(url) === "html" || extOf(url) === "htm") return;
-  if (isExcluded(urlHost(url), currentSettings.exclude)) return;
+  const host = urlHost(url);
+  if (isExcluded(host, currentSettings.exclude)) return;
   if (currentSettings.httpsOnly && !url.toLowerCase().startsWith("https://")) return;
-  const recent = recentSubmitted.get(url);
-  if (recent && recent > Date.now()) return;
+  // Site-rule noAuto is for click/media interception, not Chrome download items —
+  // otherwise real file downloads from video CDNs silently fall back to the browser.
+  const pref = sitePrefFor(host, currentSettings.sitePrefs);
+  if (pref === "browser") return;
+  if (isRecentlySubmitted(url)) return;
   if (item.state !== "in_progress") return;
   if (item.totalBytes > 0 && item.totalBytes < currentSettings.minSize) return;
 
-  if (appState.checkedAt === 0) await refreshAppState(false);
+  if (appState.checkedAt === 0) await refreshAppState(true);
   if (appState.hostPresent === false) return;
+  if (!appState.appOnline) {
+    // Try to wake the desktop app once before deciding ask/smart.
+    await refreshAppState(true);
+  }
 
+  // Record the pause *before* performing it, so a worker death in the window
+  // between these two statements is still recoverable on next startup.
+  await markPausedByUs(id);
   const paused = await pauseWithRetry(id);
-  if (!paused) return;
+  if (!paused) {
+    await clearPausedByUs(id);
+    return;
+  }
   item = (await searchDownload(id)) || item;
   if (item.state === "complete" || item.state === "interrupted") {
-    await resumeDownload(id).catch(() => {});
+    await releaseDownload(id);
     return;
   }
   if (item.totalBytes > 0 && item.totalBytes < currentSettings.minSize) {
-    await resumeDownload(id).catch(() => {});
+    await releaseDownload(id);
     return;
   }
 
+  if (pref === "xdl" || currentSettings.mode === "smart") {
+    await takeOverItem(item);
+    return;
+  }
   if (currentSettings.mode === "ask") {
+    // Ownership of the paused download passes to the ask ledger, which has
+    // its own timeout, so the pause record is intentionally left in place.
     await askToTakeOver(item);
     return;
   }
-  await takeOverItem(item);
+  await releaseDownload(id);
 }
 
 async function takeOverItem(item: chrome.downloads.DownloadItem, dir?: string): Promise<boolean> {
@@ -453,17 +524,26 @@ async function takeOverItem(item: chrome.downloads.DownloadItem, dir?: string): 
   // Do not forward the browser's provisional filename: at onCreated time
   // Chrome may still report an opaque GUID. Content-Disposition from the
   // server (or the URL leaf) is authoritative for downloads takeover.
-  const result = await submitDownload({
-    url,
-    pageUrl: item.referrer,
-    dir,
-  });
+  let result: TakeoverResult;
+  try {
+    result = await submitDownload({
+      url,
+      pageUrl: item.referrer,
+      dir,
+    });
+  } catch (err) {
+    // Unexpected throw: the download must still go back to the browser.
+    await releaseDownload(item.id);
+    return false;
+  }
   if (result.ok) {
+    await clearPausedByUs(item.id);
     await cancelDownload(item.id);
     await eraseDownload(item.id);
+    unmarkConsidered(item.id);
     return true;
   }
-  await resumeDownload(item.id).catch(() => {});
+  await releaseDownload(item.id);
   const name = downloadName(item);
   await notify(
     "XDL 未能接管下载",
@@ -518,7 +598,23 @@ async function resumeIfPaused(downloadId: number) {
   }
 }
 
-async function finishAsk(notificationId: string, choice: AskChoice | "timeout", dir?: string) {
+async function rememberSitePref(url: string, choice: AskChoice) {
+  const host = urlHost(url);
+  if (!host) return;
+  const next = {
+    ...currentSettings,
+    sitePrefs: { ...currentSettings.sitePrefs, [host]: choice },
+  };
+  currentSettings = await saveSettings(next);
+  await broadcastState();
+}
+
+async function finishAsk(
+  notificationId: string,
+  choice: AskChoice | "timeout",
+  dir?: string,
+  remember?: boolean,
+) {
   const pending = askPending.get(notificationId);
   if (!pending) return;
   askPending.delete(notificationId);
@@ -533,14 +629,36 @@ async function finishAsk(notificationId: string, choice: AskChoice | "timeout", 
     /* ignore */
   }
   await persistAsks();
-  if (choice === "xdl") {
-    const item = await searchDownload(pending.downloadId);
+
+  const item = await searchDownload(pending.downloadId);
+  const url = item?.finalUrl || item?.url || "";
+
+  let resolved: AskChoice =
+    choice === "timeout"
+      ? currentSettings.askTimeoutToXdl !== false && appState.appOnline
+        ? "xdl"
+        : "browser"
+      : choice;
+
+  if (remember && (resolved === "xdl" || resolved === "browser") && url) {
+    await rememberSitePref(url, resolved);
+  }
+
+  if (resolved === "xdl") {
     if (item && item.state !== "complete" && item.state !== "interrupted") {
-      await takeOverItem(item, dir || pending.dir);
+      const ok = await takeOverItem(item, dir || pending.dir);
+      if (!ok && choice === "timeout") {
+        // Already resumed inside takeOverItem on failure.
+        return;
+      }
     }
     return;
   }
+  await clearPausedByUs(pending.downloadId);
   await resumeIfPaused(pending.downloadId);
+  if (choice === "timeout") {
+    await notify("已回退浏览器下载", pending.name, "xdl-ask-timeout");
+  }
 }
 
 async function defaultDownloadDir(): Promise<string> {
@@ -578,6 +696,7 @@ async function restoreAsks() {
     const item = await searchDownload(pending.downloadId);
     if (!item || item.state === "complete" || item.state === "interrupted") {
       await forgetAsk(id);
+      await clearPausedByUs(pending.downloadId);
       continue;
     }
     if (Date.now() >= pending.expiresAt) {
@@ -589,6 +708,34 @@ async function restoreAsks() {
     } catch {
       await finishAsk(id, "browser");
     }
+  }
+}
+
+/**
+ * The recovery pass that makes the takeover pipeline safe across worker
+ * termination. Any download this worker paused but never resolved — because
+ * the worker was killed mid-handoff — is resumed so the browser finishes it.
+ */
+async function recoverStrandedDownloads() {
+  const ids = await restorePaused();
+  if (!ids.length) return;
+  let resumed = 0;
+  for (const id of ids) {
+    // Downloads owned by a live ask ledger are handled by restoreAsks.
+    if ([...askPending.values()].some((p) => p.downloadId === id)) continue;
+    const item = await searchDownload(id);
+    if (!item || item.state === "complete" || item.state === "interrupted") continue;
+    if (item.paused && item.state === "in_progress") {
+      await resumeDownload(id).catch(() => {});
+      resumed++;
+    }
+  }
+  if (resumed > 0) {
+    await notify(
+      "XDL 已把下载交回浏览器",
+      `${resumed} 个下载因后台组件重启而恢复，请重新点击以使用加速。`,
+      "xdl-recover",
+    );
   }
 }
 
@@ -653,6 +800,12 @@ function setupNotifications() {
     void ready.then(() => finishAsk(notificationId, "browser"));
   });
   chrome.alarms.onAlarm.addListener((alarm) => {
+    // The heartbeat itself: touching the API resets the idle timer, which is
+    // the whole point while a takeover is in flight.
+    if (alarm.name === KEEPALIVE_ALARM) {
+      if (keepaliveNeeded <= 0) void stopKeepalive();
+      return;
+    }
     if (!alarm.name.startsWith("xdl-ask-")) return;
     void ready.then(() => finishAsk(alarm.name, "timeout"));
   });
@@ -746,8 +899,20 @@ function pageUrlOf(details: { initiator?: string }): string | undefined {
 function setupWebRequest() {
   chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
-      if (details.tabId < 0 || !isMediaURL(details.url)) return undefined;
-      const c = mediaCandidate(details.url, { pageUrl: pageUrlOf(details) });
+      if (details.tabId < 0) return undefined;
+      const url = details.url;
+      let forced: ReturnType<typeof mediaKindFor> = mediaKindFor(url);
+      if (!forced && currentSettings.siteRules !== false) {
+        const h = ruleHintsFor(url);
+        if (h.hls) forced = "hls";
+        else if (h.dash) forced = "dash";
+        // A URL a site rule positively recognises as a stream endpoint, even
+        // with no extension at all. This is what catches signed CDN URLs like
+        // /up1/xz/video.mp4?token=… or /watch/videoplayback?expires=…
+        else if (h.isStream) forced = h.preferKind || "video";
+      }
+      if (!forced && !isMediaURL(url)) return undefined;
+      const c = mediaCandidate(url, { pageUrl: pageUrlOf(details), kind: forced || undefined });
       if (c) void addMedia(details.tabId, c);
       return undefined;
     },
@@ -794,8 +959,7 @@ function setupWebRequest() {
       }
       if (referer || origin || authorization) {
         captureRequestHeaders(details.tabId, details.url, { referer, origin, authorization });
-      }
-      return undefined;
+      }      return undefined;
     },
     {
       urls: ["<all_urls>"],
@@ -822,10 +986,15 @@ async function ensureMenus() {
   create({ id: "xdl-media", title: "用 XDL 下载媒体", contexts: ["image", "video", "audio"] });
   create({ id: "xdl-scan", title: "扫描本页媒体", contexts: ["page"] });
   create({ id: "xdl-scan-links", title: "扫描本页可下载链接", contexts: ["page"] });
+  create({ id: "xdl-selected", title: "用 XDL 下载所选链接", contexts: ["selection"] });
 }
 
 async function handleMenuClick(info: chrome.contextMenus.OnClickData, tab?: chrome.tabs.Tab) {
   await ready;
+  await withKeepalive(() => handleMenuClickInner(info, tab));
+}
+
+async function handleMenuClickInner(info: chrome.contextMenus.OnClickData, tab?: chrome.tabs.Tab) {
   if (info.menuItemId === "xdl-scan") {
     if (tab?.id == null) return;
     const list = await listMedia(tab.id);
@@ -844,9 +1013,13 @@ async function handleMenuClick(info: chrome.contextMenus.OnClickData, tab?: chro
         target: { tabId: tab.id },
         func: () => {
           const exts = new Set([
-            "zip", "rar", "7z", "tar", "gz", "exe", "msi", "pdf", "epub",
-            "mp4", "mkv", "webm", "mp3", "flac", "jpg", "jpeg", "png", "gif",
-            "webp", "m3u8", "mpd", "torrent", "iso", "apk",
+            "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "exe", "msi", "apk", "dmg",
+            "iso", "img", "bin", "pdf", "epub", "mobi", "rtf", "doc", "docx", "xls", "xlsx", "ppt",
+            "pptx", "odt", "ods", "mp4", "mkv", "webm", "avi", "mov", "flv", "wmv", "mp3", "flac",
+            "wav", "aac", "m4a", "ogg", "opus", "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg",
+            "ico", "tiff", "heic", "psd", "ai", "eps", "sketch", "fig", "blend", "ttf", "otf",
+            "woff", "woff2", "sql", "sqlite", "db", "bak", "json", "xml", "csv", "txt", "log",
+            "m3u8", "mpd", "torrent", "srt", "vtt", "ass",
           ]);
           const urls: string[] = [];
           const seen = new Set<string>();
@@ -859,7 +1032,12 @@ async function handleMenuClick(info: chrome.contextMenus.OnClickData, tab?: chro
               const path = u.pathname.toLowerCase();
               const i = path.lastIndexOf(".");
               const ext = i >= 0 ? path.slice(i + 1) : "";
-              if (!exts.has(ext)) return;
+              // Keep extensionless candidates too: many real download
+              // endpoints are /download?id=... with no file suffix.
+              const looksLikeEndpoint = /(^|\/)(download|file|attachment|get|dl)(\/|-|\?|$)/i.test(
+                `${path}${u.search}`,
+              );
+              if (!exts.has(ext) && !looksLikeEndpoint) return;
               const key = u.toString();
               if (seen.has(key)) return;
               seen.add(key);
@@ -869,10 +1047,12 @@ async function handleMenuClick(info: chrome.contextMenus.OnClickData, tab?: chro
             }
           };
           document.querySelectorAll("a[href]").forEach((a) => push((a as HTMLAnchorElement).href));
-          document.querySelectorAll("img[src], video[src], audio[src], source[src]").forEach((el) =>
-            push((el as HTMLImageElement).src || (el as HTMLSourceElement).src),
-          );
-          return urls.slice(0, 200);
+          document
+            .querySelectorAll("img[src], video[src], audio[src], source[src], iframe[src], embed[src]")
+            .forEach((el) =>
+              push((el as HTMLImageElement).src || (el as HTMLSourceElement).src),
+            );
+          return urls.slice(0, 300);
         },
       });
       const urls = (injected[0]?.result as string[] | undefined) || [];
@@ -880,17 +1060,59 @@ async function handleMenuClick(info: chrome.contextMenus.OnClickData, tab?: chro
         await notify("未发现可下载链接", "当前页没有常见扩展名的文件链接。也可在 XDL 里用「网站抓取」。", "xdl-scan-links");
         return;
       }
-      let ok = 0;
-      for (const url of urls) {
-        const r = await submitDownload({ url, pageUrl: tab.url, force: true });
-        if (r.ok) ok++;
-      }
-      await notify("已批量发送", `发现 ${urls.length} 个链接，成功 ${ok} 个交给 XDL。`, "xdl-scan-links");
+      // Single batched round trip: the serial version took minutes on a page
+      // with many links and looked like a hang.
+      const res = (await nativeCall<BatchAddResult>(
+        "batch.add",
+        { urls: urls.slice(0, 500), dir: "" },
+        { timeoutMs: 60000 },
+      )) as BatchAddResult & { error?: string; data?: { code?: string } };
+      applyNativeSuccess();
+      const added = res?.added?.length || 0;
+      const skipped = res?.skipped || 0;
+      const failed = res?.failures?.length || 0;
+      for (const url of urls) markSubmitted(url);
+      await notify(
+        added ? "已交给 XDL" : "未添加任何下载",
+        `发现 ${urls.length} 个链接，新增 ${added} 个` +
+          (skipped ? `，跳过重复 ${skipped} 个` : "") +
+          (failed ? `，失败 ${failed} 个` : "") +
+          "。",
+        "xdl-scan-links",
+      );
     } catch {
-      await notify("无法扫描此页面", "当前页面不允许扩展脚本运行。请刷新普通网页后重试。", "xdl-scan-links");
+      await notify("无法扫描此页面", "当前页面不允许扩展脚本运行，或 XDL 未运行。请刷新普通网页后重试。", "xdl-scan-links");
     }
     return;
   }
+  if (info.menuItemId === "xdl-selected") {
+    const urls = collectSelectionUrls(info);
+    if (!urls.length) {
+      await notify("没有可下载的链接", "选中的文本里没有 http(s) 文件链接。", "xdl-selected");
+      return;
+    }
+    try {
+      const res = await nativeCall<BatchAddResult>(
+        "batch.add",
+        { urls: urls.slice(0, 300), dir: "" },
+        { timeoutMs: 60000 },
+      );
+      applyNativeSuccess();
+      const added = res?.added?.length || 0;
+      const skipped = res?.skipped || 0;
+      for (const u of urls) markSubmitted(u);
+      await notify(
+        added ? "已交给 XDL" : "未添加任何下载",
+        `选中 ${urls.length} 个链接，新增 ${added} 个${skipped ? `，跳过重复 ${skipped} 个` : ""}。`,
+        "xdl-selected",
+      );
+    } catch (err) {
+      applyNativeFailure(err);
+      await notify("XDL 未能接收", friendlyError(errCode(err), errMessage(err)), "xdl-selected");
+    }
+    return;
+  }
+
   let url = "";
   if (info.menuItemId === "xdl-link") url = info.linkUrl || "";
   if (info.menuItemId === "xdl-media") url = info.srcUrl || "";
@@ -938,6 +1160,15 @@ async function handleMessage(
   sender: chrome.runtime.MessageSender,
 ): Promise<unknown> {
   await ready;
+  // Every message may drive a native round trip or a directory picker, both of
+  // which outlive Chrome's idle budget without a heartbeat.
+  return withKeepalive(() => handleMessageInner(msg, sender));
+}
+
+async function handleMessageInner(
+  msg: BgMessage,
+  sender: chrome.runtime.MessageSender,
+): Promise<unknown> {
   switch (msg.type) {
     case "state.get":
       return { ok: true, state: contentState() };
@@ -1003,7 +1234,7 @@ async function handleMessage(
     case "ask.answer": {
       // Pending IDs are minted only by this service worker; answering one is enough auth.
       if (!askPending.has(msg.notificationId)) return { ok: false, error: "询问已失效" };
-      await finishAsk(msg.notificationId, msg.choice, msg.dir);
+      await finishAsk(msg.notificationId, msg.choice, msg.dir, !!msg.remember);
       return { ok: true };
     }
     case "media.scan": {
@@ -1064,6 +1295,43 @@ async function handleMessage(
       const st = await refreshAppState(true);
       return { ok: st.appOnline, app: st };
     }
+    case "bulk.takeover": {
+      const urls = (msg.urls || []).filter((u) => isHTTPUrl(u)).slice(0, 300);
+      if (!urls.length) return { ok: false, error: "没有可提交的链接" };
+      // One round trip for the whole selection.
+      const res = await nativeCall<BatchAddResult>(
+        "batch.add",
+        { urls, dir: msg.dir || "" },
+        { timeoutMs: 60000 },
+      );
+      applyNativeSuccess();
+      for (const u of urls) markSubmitted(u);
+      return {
+        ok: true,
+        added: res?.added?.length || 0,
+        skipped: res?.skipped || 0,
+        failures: res?.failures?.length || 0,
+      };
+    }
+    case "batch.add": {
+      const urls = (msg.urls || []).filter((u) => isHTTPUrl(u)).slice(0, 500);
+      if (!urls.length) return { ok: false, error: "没有可提交的链接" };
+      try {
+        // One round trip for the whole page instead of one per link: this is
+        // what makes "scan this page" finish in seconds rather than minutes.
+        const res = await nativeCall<BatchAddResult>(
+          "batch.add",
+          { urls, dir: msg.dir || "" },
+          { timeoutMs: 60000 },
+        );
+        applyNativeSuccess();
+        for (const u of urls) markSubmitted(u);
+        return { ok: true, added: res?.added || [], skipped: res?.skipped || 0, failures: res?.failures || [] };
+      } catch (err) {
+        applyNativeFailure(err);
+        return { ok: false, error: friendlyError(errCode(err), errMessage(err)), code: errCode(err) };
+      }
+    }
     case "toast":
       await toastTab(sender.tab?.id, msg.kind, msg.text);
       return { ok: true };
@@ -1078,10 +1346,83 @@ async function handleMessage(
 
 async function init() {
   currentSettings = await loadSettings();
+  await restoreAll();
   await restoreAsks();
+  // Resume anything this worker left paused before it was terminated.
+  await recoverStrandedDownloads();
   await ensureMenus();
   await broadcastState();
   void refreshAppState(false);
+}
+
+/**
+ * Extracts downloadable URLs from a text selection.
+ *
+ * Plain http(s) matching is deliberately not enough — a selection of page
+ * prose contains links that are navigation, not files, and handing those to the
+ * batch endpoint would queue junk. Only URLs the classifier accepts qualify.
+ */
+function collectSelectionUrls(info: chrome.contextMenus.OnClickData): string[] {
+  const raw = (info.selectionText || "").match(/https?:\/\/[^\s"'<>()]+/gi) || [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const r of raw) {
+    const url = r.replace(/[.,;:!?)\]}]+$/, "");
+    if (!isHTTPUrl(url)) continue;
+    const verdict = classifyLink(url);
+    if (verdict.kind === "ignore") continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
+/**
+ * Keeps the MV3 worker alive while there is real work in flight.
+ *
+ * Chrome terminates an idle worker after ~30s. The takeover pipeline pauses a
+ * browser download and then performs a multi-second native round trip, which is
+ * exactly the window where termination used to strand the download in a paused
+ * state forever. A cheap alarm heartbeat holds the worker for the duration of
+ * that work and is removed as soon as nothing is outstanding, so the extension
+ * still sleeps normally when idle.
+ */
+const KEEPALIVE_ALARM = "xdl-keepalive";
+let keepaliveRef = 0;
+let keepaliveNeeded = 0;
+
+/** Holds the worker alive for the duration of an async operation. */
+async function withKeepalive<T>(fn: () => Promise<T>): Promise<T> {
+  keepaliveNeeded++;
+  await ensureKeepalive();
+  try {
+    return await fn();
+  } finally {
+    keepaliveNeeded = Math.max(0, keepaliveNeeded - 1);
+    if (keepaliveNeeded === 0) await stopKeepalive();
+  }
+}
+
+async function ensureKeepalive() {
+  keepaliveRef++;
+  try {
+    await chrome.alarms.create(KEEPALIVE_ALARM, {
+      periodInMinutes: KEEPALIVE_PERIOD_S / 60,
+    });
+  } catch {
+    /* alarms unavailable */
+  }
+}
+
+async function stopKeepalive() {
+  keepaliveRef = Math.max(0, keepaliveRef - 1);
+  if (keepaliveRef > 0) return;
+  try {
+    await chrome.alarms.clear(KEEPALIVE_ALARM);
+  } catch {
+    /* ignore */
+  }
 }
 
 export function setupBackground() {

@@ -30,6 +30,12 @@ type ProbeResult struct {
 	Filename     string
 	ContentType  string
 	SingleStream bool // server ignored Range / returned 200
+	// SampleBps is a rough single-connection throughput from the probe body
+	// (bytes/sec). Used by SuggestConns after first-packet probing.
+	SampleBps int64
+	TTFB      time.Duration
+	// SHA256 is a digest declared by the server (Content-Digest / Digest).
+	SHA256 string
 }
 
 // Probe does GET with Range: bytes=0-0 and Accept-Encoding: identity.
@@ -66,18 +72,23 @@ func Probe(ctx context.Context, client *http.Client, rawURL string, headers http
 	return nil, lastErr
 }
 
+const probeSampleBytes = 256 << 10 // up to 256 KiB for first-packet speed sample
+
 func probeOnce(ctx context.Context, client *http.Client, rawURL string, headers http.Header) (*ProbeResult, time.Duration, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	copyHeaders(req.Header, headers)
-	req.Header.Set("Range", "bytes=0-0")
+	// Request a small window so Accept-Ranges + size still work, while leaving
+	// enough body to estimate single-connection throughput for SuggestConns.
+	req.Header.Set("Range", "bytes=0-"+strconv.Itoa(probeSampleBytes-1))
 	req.Header.Set("Accept-Encoding", "identity")
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", defaultUA)
 	}
 
+	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -86,7 +97,10 @@ func probeOnce(ctx context.Context, client *http.Client, rawURL string, headers 
 		return nil, 0, NewTaskError(ErrCodeProbeFailed, err.Error(), "检查网络或代理设置")
 	}
 	defer resp.Body.Close()
-	io.CopyN(io.Discard, resp.Body, 64*1024)
+	ttfb := time.Since(start)
+	sampleStart := time.Now()
+	sampled, _ := io.CopyN(io.Discard, resp.Body, probeSampleBytes)
+	sampleElapsed := time.Since(sampleStart).Seconds()
 
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
@@ -113,6 +127,11 @@ func probeOnce(ctx context.Context, client *http.Client, rawURL string, headers 
 		LastModified: resp.Header.Get("Last-Modified"),
 		ContentType:  resp.Header.Get("Content-Type"),
 		Filename:     filenameFromResponse(resp),
+		TTFB:         ttfb,
+		SHA256:       ParseDeclaredSHA256(resp.Header),
+	}
+	if sampled > 0 && sampleElapsed > 0 {
+		pr.SampleBps = int64(float64(sampled) / sampleElapsed)
 	}
 
 	switch resp.StatusCode {
@@ -122,7 +141,7 @@ func probeOnce(ctx context.Context, client *http.Client, rawURL string, headers 
 		if pr.Size <= 0 {
 			if cl := resp.Header.Get("Content-Length"); cl != "" {
 				if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
-					pr.Size = n // unlikely for 206 with 0-0, but keep
+					pr.Size = n
 				}
 			}
 		}
@@ -135,7 +154,7 @@ func probeOnce(ctx context.Context, client *http.Client, rawURL string, headers 
 			}
 		}
 		if strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes") {
-			// Some servers advertise Accept-Ranges but still return 200 for Range:0-0.
+			// Some servers advertise Accept-Ranges but still return 200 for Range.
 			// Treat as unknown; fetcher will retry with real ranges and may upgrade.
 			pr.AcceptRanges = true
 		}

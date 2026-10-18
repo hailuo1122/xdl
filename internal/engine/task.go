@@ -15,6 +15,7 @@ const (
 	KindHLS     Kind = "hls"
 	KindDASH    Kind = "dash"
 	KindTorrent Kind = "torrent"
+	KindFTP     Kind = "ftp"
 	KindBatch   Kind = "batch"
 	KindGrab    Kind = "grab"
 )
@@ -47,27 +48,32 @@ type TaskError struct {
 }
 
 type Task struct {
-	ID        TaskID          `json:"id"`
-	Kind      Kind            `json:"kind"`
-	URL       string          `json:"url"`
-	FinalURL  string          `json:"finalUrl,omitempty"`
-	Dir       string          `json:"dir"`
-	Name      string          `json:"name"`
-	FinalPath string          `json:"finalPath,omitempty"`
-	PartPath  string          `json:"partPath,omitempty"`
-	Size      int64           `json:"size"`
-	Done      int64           `json:"done"`
-	Speed     int64           `json:"speed"` // bytes/sec, ephemeral
-	Validator Validator       `json:"validator"`
-	State     State           `json:"state"`
-	Priority  int             `json:"priority"`
-	Category  string          `json:"category,omitempty"`
-	Conns     int             `json:"conns"`
-	Headers   http.Header     `json:"headers,omitempty"`
-	KindMeta  json.RawMessage `json:"kindMeta,omitempty"`
-	Err       *TaskError      `json:"err,omitempty"`
-	CreatedAt time.Time       `json:"createdAt"`
-	UpdatedAt time.Time       `json:"updatedAt"`
+	ID             TaskID          `json:"id"`
+	Kind           Kind            `json:"kind"`
+	URL            string          `json:"url"`
+	Mirrors        []string        `json:"mirrors,omitempty"` // multi-source alternates
+	Proxy          string          `json:"proxy,omitempty"`   // per-task proxy; empty = environment
+	FinalURL       string          `json:"finalUrl,omitempty"`
+	Dir            string          `json:"dir"`
+	Name           string          `json:"name"`
+	FinalPath      string          `json:"finalPath,omitempty"`
+	PartPath       string          `json:"partPath,omitempty"`
+	Size           int64           `json:"size"`
+	Done           int64           `json:"done"`
+	Speed          int64           `json:"speed"` // bytes/sec, ephemeral
+	LimitBps       int64           `json:"limitBps,omitempty"`
+	ExpectedSHA256 string          `json:"expectedSha256,omitempty"`
+	SHA256         string          `json:"sha256,omitempty"`
+	Validator      Validator       `json:"validator"`
+	State          State           `json:"state"`
+	Priority       int             `json:"priority"`
+	Category       string          `json:"category,omitempty"`
+	Conns          int             `json:"conns"`
+	Headers        http.Header     `json:"headers,omitempty"`
+	KindMeta       json.RawMessage `json:"kindMeta,omitempty"`
+	Err            *TaskError      `json:"err,omitempty"`
+	CreatedAt      time.Time       `json:"createdAt"`
+	UpdatedAt      time.Time       `json:"updatedAt"`
 }
 
 type ChunkState string

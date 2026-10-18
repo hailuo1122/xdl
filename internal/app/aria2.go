@@ -137,7 +137,7 @@ func (rt *Runtime) ariaExec(id any, methodName string, params []json.RawMessage)
 	case "getVersion":
 		return ariaOK(id, map[string]any{
 			"version":         "1.37.0",
-			"enabledFeatures": []string{"Async DNS", "BitTorrent", "Firefox3 Cookie", "GZip", "HTTPS", "Message Digest", "XML-RPC"},
+			"enabledFeatures": []string{"Async DNS", "BitTorrent", "Firefox3 Cookie", "FTP", "GZip", "HTTPS", "Message Digest", "Metalink", "XML-RPC"},
 		})
 	case "tellStatus":
 		gid, _ := paramString(params, 0)
@@ -275,6 +275,17 @@ func (rt *Runtime) ariaMulticall(params []json.RawMessage) []any {
 	}
 	return out
 }
+func ariaSHA256(raw string) string {
+	raw = strings.TrimSpace(raw)
+	low := strings.ToLower(raw)
+	for _, prefix := range []string{"sha-256=", "sha256="} {
+		if strings.HasPrefix(low, prefix) {
+			return strings.TrimSpace(raw[len(prefix):])
+		}
+	}
+	return ""
+}
+
 func (rt *Runtime) ariaAddURI(params []json.RawMessage) (string, error) {
 	if len(params) == 0 {
 		return "", fmt.Errorf("uris required")
@@ -283,18 +294,17 @@ func (rt *Runtime) ariaAddURI(params []json.RawMessage) (string, error) {
 	if err := json.Unmarshal(params[0], &uris); err != nil || len(uris) == 0 {
 		return "", fmt.Errorf("uris required")
 	}
-	url := ""
+	var urls []string
 	for _, u := range uris {
 		u = strings.TrimSpace(u)
 		if u != "" {
-			url = u
-			break
+			urls = append(urls, u)
 		}
 	}
-	if url == "" {
+	if len(urls) == 0 {
 		return "", fmt.Errorf("empty uri")
 	}
-	req := AddRequest{URL: url}
+	req := AddRequest{URL: urls[0], Mirrors: urls[1:]}
 	if len(params) > 1 {
 		var opt map[string]any
 		_ = json.Unmarshal(params[1], &opt)
@@ -306,6 +316,14 @@ func (rt *Runtime) ariaAddURI(params []json.RawMessage) (string, error) {
 		}
 		if n, ok := numberOpt(opt["split"]); ok && n > 0 {
 			req.Conns = n
+		}
+		if cs, ok := opt["checksum"].(string); ok {
+			req.ExpectedSHA256 = ariaSHA256(cs)
+		}
+		if p, ok := opt["all-proxy"].(string); ok && strings.TrimSpace(p) != "" {
+			req.Proxy = strings.TrimSpace(p)
+		} else if p, ok := opt["http-proxy"].(string); ok {
+			req.Proxy = strings.TrimSpace(p)
 		}
 		req.Headers = headerOpt(opt)
 	}

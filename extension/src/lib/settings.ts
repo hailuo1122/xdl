@@ -1,10 +1,10 @@
-import { DEFAULT_SETTINGS, type ExtensionSettings, type TakeoverMode } from "./types";
+import { DEFAULT_SETTINGS, type ExtensionSettings, type SitePref, type TakeoverMode } from "./types";
 
 const KEY = "xdl.settings";
 
 function clampSettings(raw: Partial<ExtensionSettings> | undefined): ExtensionSettings {
   const s: ExtensionSettings = { ...DEFAULT_SETTINGS, ...(raw || {}) };
-  if (s.mode !== "smart" && s.mode !== "ask" && s.mode !== "off") s.mode = "ask";
+  if (s.mode !== "smart" && s.mode !== "ask" && s.mode !== "off") s.mode = "smart";
   if (!Number.isFinite(s.minSize) || s.minSize < 0) s.minSize = DEFAULT_SETTINGS.minSize;
   s.minSize = Math.min(s.minSize, 1024 * 1024 * 1024);
   if (!Array.isArray(s.exclude)) s.exclude = [];
@@ -15,7 +15,29 @@ function clampSettings(raw: Partial<ExtensionSettings> | undefined): ExtensionSe
   s.httpsOnly = !!s.httpsOnly;
   s.mediaSniff = s.mediaSniff !== false;
   s.notifyFallback = s.notifyFallback !== false;
+  s.siteRules = s.siteRules !== false;
+  s.askTimeoutToXdl = s.askTimeoutToXdl !== false;
+  s.bulkSelect = s.bulkSelect !== false;
+  const prefs: Record<string, SitePref> = {};
+  const rawPrefs = (raw?.sitePrefs || s.sitePrefs || {}) as Record<string, unknown>;
+  for (const [k, v] of Object.entries(rawPrefs)) {
+    const host = String(k).trim().toLowerCase().replace(/^\.+/, "");
+    if (!host || host.length > 253) continue;
+    if (v === "xdl" || v === "browser") prefs[host] = v;
+    if (Object.keys(prefs).length >= 200) break;
+  }
+  s.sitePrefs = prefs;
   return s;
+}
+
+export function sitePrefFor(host: string, prefs: Record<string, SitePref> | undefined): SitePref | undefined {
+  const h = host.toLowerCase();
+  if (!h || !prefs) return undefined;
+  if (prefs[h]) return prefs[h];
+  for (const [k, v] of Object.entries(prefs)) {
+    if (h === k || h.endsWith("." + k)) return v;
+  }
+  return undefined;
 }
 
 export async function loadSettings(): Promise<ExtensionSettings> {

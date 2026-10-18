@@ -336,13 +336,41 @@ export function SettingsDialog({
                 <div className="setting-row">
                   <div>
                     <span>全局限速</span>
-                    <small>对所有任务生效，修改后立即生效。</small>
+                    <small>对所有任务生效，修改后立即生效。单任务还可在新建/详情里单独限速。</small>
                   </div>
                   <Select
                     aria-label="全局限速"
                     value={draft.globalLimitBps}
                     onChange={(v) => patch({ globalLimitBps: v })}
                     options={limits}
+                  />
+                </div>
+              </div>
+              <div className="settings-group">
+                <h3>队列规则</h3>
+                <div className="setting-row">
+                  <div>
+                    <span>同域名并发上限</span>
+                    <small>限制同一主机同时下载的任务数，减轻限流。0 表示不额外限制。</small>
+                  </div>
+                  <Select
+                    aria-label="同域名并发上限"
+                    value={draft.domainConcurrency ?? 2}
+                    onChange={(v) => patch({ domainConcurrency: v })}
+                    options={[0, 1, 2, 3, 4].map((n) => ({
+                      value: n,
+                      label: n === 0 ? "不限制" : String(n),
+                    }))}
+                  />
+                </div>
+                <div className="setting-row">
+                  <div>
+                    <span>剪贴板监听</span>
+                    <small>检测到磁力链接、.torrent 路径或 http(s) 链接时自动打开新建对话框。</small>
+                  </div>
+                  <Switch
+                    checked={!!draft.watchClipboard}
+                    onChange={(v) => patch({ watchClipboard: v })}
                   />
                 </div>
               </div>

@@ -21,7 +21,10 @@ export default defineConfig({
       "notifications",
       "alarms",
       "tabs",
-      "activeTab"
+      "activeTab",
+      // chrome.scripting.executeScript — "扫描本页可下载链接" menu item.
+      // host_permissions alone does NOT grant this; without it the API throws.
+      "scripting",
     ],
     host_permissions: ["<all_urls>"],
     action: { default_title: "XDL 下载接管" },

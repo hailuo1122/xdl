@@ -47,6 +47,20 @@ type Settings struct {
 	Aria2Enabled bool   `json:"aria2Enabled"`
 	Aria2Port    int    `json:"aria2Port"`
 	Aria2Secret  string `json:"aria2Secret"`
+	// WatchClipboard opens the new-task dialog when the clipboard gains a
+	// magnet, .torrent path, or direct-download URL.
+	WatchClipboard bool `json:"watchClipboard"`
+	// DomainConcurrency caps how many tasks may run against one host.
+	// 0 means no extra cap beyond MaxConcurrent.
+	DomainConcurrency int         `json:"domainConcurrency"`
+	ExtPolicies       []ExtPolicy `json:"extPolicies,omitempty"`
+}
+
+// ExtPolicy tunes queue behavior for a file extension (no leading dot).
+// Action is one of: normal, high, low, skip, serial.
+type ExtPolicy struct {
+	Ext    string `json:"ext"`
+	Action string `json:"action"`
 }
 
 // Store is the subset of the engine store needed here.
@@ -73,6 +87,9 @@ func Defaults(dataDir string) Settings {
 		BTMaxPeers:         50,
 		AutoCategory:       true,
 		Categories:         DefaultCategories(),
+		WatchClipboard:     true,
+		DomainConcurrency:  2,
+		ExtPolicies:        DefaultExtPolicies(),
 		ScheduleEnabled:    false,
 		SchedulePauseStart: 0,
 		SchedulePauseEnd:   0,
@@ -150,6 +167,13 @@ func Normalize(s *Settings, dataDir string) {
 	if s.Categories == nil {
 		s.Categories = DefaultCategories()
 	}
+	if s.ExtPolicies == nil {
+		s.ExtPolicies = DefaultExtPolicies()
+	}
+	if s.DomainConcurrency < 0 || s.DomainConcurrency > 8 {
+		s.DomainConcurrency = def.DomainConcurrency
+	}
+	s.ExtPolicies = NormalizeExtPolicies(s.ExtPolicies)
 	if s.SchedulePauseStart < 0 || s.SchedulePauseStart > 23 {
 		s.SchedulePauseStart = 0
 	}

@@ -1,6 +1,24 @@
 import { DEFAULT_SETTINGS, type AppState, type ContentMessage, type ContentState, type ExtensionSettings, type MediaCandidate } from "../lib/types";
-import { isExcluded } from "../lib/settings";
-import { BINARY_EXTS, baseName, extOf, formatBytes, isHTTPUrl, isMediaURL, mediaCandidate, mediaKindFor } from "../lib/context";
+import { isExcluded, sitePrefFor } from "../lib/settings";
+import { ruleHintsFor } from "../lib/siteRules";
+import {
+  baseName,
+  classifyLink,
+  formatBytes,
+  isCrawlerContext,
+  isHTTPUrl,
+  isMediaURL,
+  mediaCandidate,
+} from "../lib/context";
+import {
+  installMseObserver,
+  noteBlob,
+  pickDownloadable,
+  recordMedia,
+  reset as resetExtractor,
+  resolveBlob,
+} from "./mediaExtractor";
+import { installBulk, setBulkEnabled, teardownBulk } from "./bulkSelect";
 
 let settings: ExtensionSettings = { ...DEFAULT_SETTINGS };
 let appState: AppState = { hostPresent: null, appOnline: false, checkedAt: 0 };
@@ -144,8 +162,14 @@ const PANEL_CSS = `
 }
 .ask .loc-row .act { flex: 0 0 auto; height: 26px; }
 .ask .hint { margin-top: 8px; color: #8b94a7; font-size: 9.5px; }
+.ask .remember {
+  margin-top: 10px; display: flex; align-items: center; gap: 7px; color: #5a6478; font-size: 10.5px;
+  user-select: none; cursor: pointer;
+}
+.ask .remember input { accent-color: #0b5fff; margin: 0; }
 .ask .row { display: flex; gap: 7px; margin-top: 11px; }
-.ask .row .act { flex: 1; height: 30px; }
+.ask .row .act { flex: 1; height: 32px; font-size: 11.5px; }
+.ask .kbd { color: #8b94a7; font-size: 9px; margin-left: 4px; font-weight: 400; }
 `;
 
 function ensureHost(): ShadowRoot | null {
@@ -178,7 +202,7 @@ function ensureHost(): ShadowRoot | null {
   panelEl.innerHTML = `
     <div class="phead"><span>本页媒体</span><span class="sub"></span><button class="x" title="关闭">×</button></div>
     <div class="plist"></div>
-    <div class="pfoot">直链 / HLS / DASH 都可交给 XDL（DRM / 直播除外）</div>`;
+    <div class="pfoot">直链 / HLS / DASH / 直播录制可交给 XDL（DRM 除外）</div>`;
   panelEl.querySelector(".x")?.addEventListener("click", () => togglePanel(false));
   listEl = panelEl.querySelector(".plist");
   countEl = panelEl.querySelector(".sub");
@@ -318,7 +342,7 @@ function showToast(kind: "info" | "success" | "error", text: string) {
 /* ask sheet                                                           */
 /* ------------------------------------------------------------------ */
 
-const ASK_TTL_MS = 45000;
+const ASK_TTL_MS = 28000;
 
 function hideAsk() {
   ensureHost();
@@ -339,20 +363,30 @@ function showAsk(opts: {
   name: string;
   sizeLabel?: string;
   defaultDir?: string;
-  onYes: (dir?: string) => void;
-  onNo: () => void;
+  onYes: (dir?: string, remember?: boolean) => void;
+  onNo: (remember?: boolean) => void;
 }) {
   ensureHost();
   if (!askEl) return;
   askEl.innerHTML = "";
   let selectedDir = (opts.defaultDir || "").trim();
+  let remember = false;
+  let settled = false;
 
   const armAskTimeout = () => {
     if (askTimer) clearTimeout(askTimer);
+    // Page-local timer only dismisses UI; background alarm owns the real decision.
     askTimer = self.setTimeout(() => {
-      hideAsk();
-      opts.onNo();
+      if (!settled) hideAsk();
     }, ASK_TTL_MS);
+  };
+
+  const settle = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    window.removeEventListener("keydown", onKey, true);
+    hideAsk();
+    fn();
   };
 
   const t = document.createElement("div");
@@ -408,31 +442,52 @@ function showAsk(opts: {
   loc.append(locLabel, locRow);
   askEl.appendChild(loc);
 
+  const rememberRow = document.createElement("label");
+  rememberRow.className = "remember";
+  const rememberBox = document.createElement("input");
+  rememberBox.type = "checkbox";
+  rememberBox.addEventListener("change", () => {
+    remember = rememberBox.checked;
+  });
+  const rememberText = document.createElement("span");
+  rememberText.textContent = "记住本站选择（下次不再询问）";
+  rememberRow.append(rememberBox, rememberText);
+  askEl.appendChild(rememberRow);
+
   const hint = document.createElement("div");
   hint.className = "hint";
-  hint.textContent = "确认后由 XDL 多连接下载；选「浏览器下载」则交回浏览器。";
+  hint.textContent = "Enter 确认 XDL · Esc 交回浏览器。超时且 XDL 在线时默认交给 XDL。";
   const row = document.createElement("div");
   row.className = "row";
   const yes = document.createElement("button");
   yes.type = "button";
   yes.className = "act primary";
-  yes.textContent = "用 XDL 下载";
-  yes.addEventListener("click", () => {
-    hideAsk();
-    opts.onYes(selectedDir || undefined);
-  });
+  yes.innerHTML = `用 XDL 下载<span class="kbd">Enter</span>`;
+  yes.addEventListener("click", () => settle(() => opts.onYes(selectedDir || undefined, remember)));
   const no = document.createElement("button");
   no.type = "button";
   no.className = "act";
   no.textContent = "浏览器下载";
-  no.addEventListener("click", () => {
-    hideAsk();
-    opts.onNo();
-  });
+  no.addEventListener("click", () => settle(() => opts.onNo(remember)));
   row.append(yes, no);
   askEl.append(hint, row);
   askEl.hidden = false;
   armAskTimeout();
+  yes.focus();
+
+  function onKey(e: KeyboardEvent) {
+    if (askEl?.hidden || settled) return;
+    if (e.key === "Enter" && !e.isComposing) {
+      e.preventDefault();
+      e.stopPropagation();
+      settle(() => opts.onYes(selectedDir || undefined, remember));
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      settle(() => opts.onNo(remember));
+    }
+  }
+  window.addEventListener("keydown", onKey, true);
 
   if (!selectedDir) {
     void sendBg<{ ok: boolean; dir?: string }>({ type: "fs.defaultDir" }).then((res) => {
@@ -456,31 +511,56 @@ function findAnchor(e: MouseEvent): HTMLAnchorElement | null {
   return target?.closest?.("a[href]") as HTMLAnchorElement | null;
 }
 
-function eligibleLink(a: HTMLAnchorElement): { url: string; name: string } | null {
+/**
+ * Decides whether a clicked anchor is a download the user wants accelerated.
+ *
+ * A `probe` verdict means "looks like a file endpoint but unproven" — we send
+ * it to the background, which cheaply verifies the Content-Type before
+ * committing. `ignore` means browsing, and must be left completely alone.
+ */
+function eligibleLink(a: HTMLAnchorElement): { url: string; name: string; probe: boolean } | null {
   if (!a.href) return null;
   if (a.getAttribute("href")?.startsWith("#")) return null;
-  if (!isHTTPUrl(a.href)) return null;
-  try {
-    const u = new URL(a.href);
-    if (u.href.split("#")[0] === location.href.split("#")[0]) return null;
-  } catch {
-    return null;
-  }
-  const ext = extOf(a.href);
-  const hasDownload = a.hasAttribute("download");
-  if (!hasDownload && !BINARY_EXTS.has(ext)) return null;
+  const rawAttr = a.getAttribute("download");
+  const verdict = classifyLink(a.href, {
+    hasDownloadAttr: a.hasAttribute("download"),
+    currentUrl: location.href,
+  });
+  if (verdict.kind === "ignore") return null;
+
   const host = new URL(a.href).hostname;
   if (isExcluded(host, settings.exclude)) return null;
   if (settings.httpsOnly && !a.href.toLowerCase().startsWith("https://")) return null;
-  const downloadAttr = a.getAttribute("download");
-  const name = downloadAttr && downloadAttr.trim() ? downloadAttr.trim() : baseName(a.href);
-  return { url: a.href, name };
+
+  const name = rawAttr && rawAttr.trim() ? rawAttr.trim() : baseName(a.href);
+  return { url: a.href, name, probe: verdict.kind === "probe" };
 }
 
 let hostWarnAt = 0;
 
-async function smartTakeOver(url: string, name: string, probeSize: boolean, force: boolean, dir?: string) {
-  showToast("info", "正在交给 XDL…");
+async function rememberHost(url: string, choice: "xdl" | "browser") {
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return;
+  }
+  if (!host) return;
+  const next: ExtensionSettings = {
+    ...settings,
+    sitePrefs: { ...(settings.sitePrefs || {}), [host]: choice },
+  };
+  settings = next;
+  await sendBg({ type: "settings.set", settings: next });
+}
+
+async function smartTakeOver(
+  url: string,
+  name: string,
+  probeSize: boolean,
+  force: boolean,
+  dir?: string,
+) {
   const res = (await sendBg<{ ok: boolean; code?: string; error?: string; task?: { name: string } }>({
     type: "link-takeover",
     url,
@@ -499,6 +579,9 @@ async function smartTakeOver(url: string, name: string, probeSize: boolean, forc
     showToast("info", res.error || "文件小于接管阈值，已交给浏览器下载");
     return;
   }
+  // A verified "this is a page" verdict means we should stay silent rather
+  // than tell the user something failed when nothing was wrong.
+  if (res.code === "NOT_A_FILE") return;
   showToast("error", `XDL 未接管：${res.error || "已回退浏览器"}`);
 }
 
@@ -510,6 +593,23 @@ function onClick(e: MouseEvent) {
   if (!a) return;
   const hit = eligibleLink(a);
   if (!hit) return;
+  try {
+    const host = new URL(hit.url).hostname;
+    const pref = sitePrefFor(host, settings.sitePrefs);
+    if (pref === "browser") return;
+    // Video sites: don't hijack ordinary clicks. Use the media panel or right-click.
+    const noAuto = settings.siteRules !== false && ruleHintsFor(hit.url).noAuto;
+    if (noAuto && pref !== "xdl") return;
+    if (pref === "xdl") {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      void smartTakeOver(hit.url, hit.name, hit.probe, true);
+      return;
+    }
+  } catch {
+    /* ignore */
+  }
   if (appState.hostPresent === false) {
     // Let Chrome perform its normal download; explain in Chinese instead of
     // surfacing "Specified native messaging host not found".
@@ -527,18 +627,35 @@ function onClick(e: MouseEvent) {
       url: hit.url,
       name: hit.name,
       // The user explicitly confirmed, so exclusion/threshold do not apply.
-      onYes: (dir) => void smartTakeOver(hit.url, hit.name, false, true, dir),
-      onNo: () => void sendBg({ type: "browser-download", url: hit.url, filename: hit.name }),
+      onYes: (dir, remember) => {
+        if (remember) void rememberHost(hit.url, "xdl");
+        void smartTakeOver(hit.url, hit.name, hit.probe, true, dir);
+      },
+      onNo: (remember) => {
+        if (remember) void rememberHost(hit.url, "browser");
+        void sendBg({ type: "browser-download", url: hit.url, filename: hit.name });
+      },
     });
     return;
   }
-  void smartTakeOver(hit.url, hit.name, true, false);
+  void smartTakeOver(hit.url, hit.name, hit.probe, false);
 }
 
 /* ------------------------------------------------------------------ */
 /* local media scan                                                    */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Collects media offered by this page.
+ *
+ * Three sources, in decreasing order of trust:
+ *  1. `performance.getEntriesByType("resource")` — what actually went over the
+ *     wire, which is how hls.js/dash.js playback becomes visible at all.
+ *  2. The extractor's curated pick, which filters that noise down to manifests
+ *     and corroborated direct files.
+ *  3. DOM elements — `<video>` / `<audio>` / `<source>`, with blob: sources
+ *     resolved back to the manifest that produced them.
+ */
 function collectLocalMedia(): MediaCandidate[] {
   const out = new Map<string, MediaCandidate>();
   const add = (url: string, mime?: string) => {
@@ -549,19 +666,31 @@ function collectLocalMedia(): MediaCandidate[] {
   };
   try {
     for (const el of document.querySelectorAll<HTMLMediaElement>("video,audio")) {
-      add(el.currentSrc);
-      add(el.src);
+      const src = el.currentSrc || el.src;
+      if (src && src.startsWith("blob:")) {
+        // MSE playback: src is opaque, but we know which manifest fed it.
+        noteBlob(src);
+        const resolved = resolveBlob(src);
+        if (resolved) add(resolved.url, resolved.mime);
+      }
+      add(src);
       for (const source of el.querySelectorAll<HTMLSourceElement>("source[src]")) add(source.src);
     }
     let count = 0;
     for (const a of document.querySelectorAll<HTMLAnchorElement>("a[href]")) {
-      if (++count > 4000) break;
+      // Bounded walk: pages with thousands of anchors exist, and the tail is
+      // almost never the download the user cares about.
+      if (++count > 1200) break;
       if (!isMediaURL(a.href)) continue;
       add(a.href);
     }
+    // Feed the extractor from the resource timeline, then take its curated pick.
     for (const entry of performance.getEntriesByType("resource")) {
       if (!isMediaURL(entry.name)) continue;
-      add(entry.name);
+      recordMedia(entry.name, undefined, undefined);
+    }
+    for (const pick of pickDownloadable()) {
+      add(pick.url, pick.mime);
     }
   } catch {
     /* DOM may be unavailable */
@@ -581,13 +710,51 @@ function mergeMedia(incoming: MediaCandidate[]) {
   updatePill();
 }
 
+/**
+ * Adaptive page scan.
+ *
+ * A fixed 4.5s interval walked every video/audio element, up to 4000 anchors
+ * and the entire `performance` resource timeline — on every page, forever, even
+ * in background tabs. That burned CPU across a whole browser session and was a
+ * primary reason the extension felt heavy.
+ *
+ * The loop now backs off aggressively while the tab is hidden, skips work when
+ * nothing is playing, and adapts its cadence to what it actually finds.
+ */
+let scanBusy = false;
+let scanFastUntil = 0;
+
+function scheduleScan() {
+  const delay = (() => {
+    if (document.hidden) return 15000; // background tab: near-idle
+    if (Date.now() < scanFastUntil) return 2500; // media flowing: keep up
+    if (media.length === 0) return 8000; // nothing found: back off
+    return 5000;
+  })();
+  self.setTimeout(scanPage, delay);
+}
+
 function scanPage() {
-  const local = collectLocalMedia();
-  const fresh = local.filter((c) => !reported.has(c.id));
-  mergeMedia(local);
-  if (fresh.length) {
-    for (const c of fresh) reported.add(c.id);
-    void sendBg({ type: "media.scan", items: fresh });
+  scheduleScan();
+  if (scanBusy || document.hidden) return;
+  scanBusy = true;
+  try {
+    const local = collectLocalMedia();
+    const fresh = local.filter((c) => !reported.has(c.id));
+    if (fresh.length) {
+      scanFastUntil = Date.now() + 30000;
+      mergeMedia(local);
+      for (const c of fresh) reported.add(c.id);
+      void sendBg({ type: "media.scan", items: fresh });
+      return;
+    }
+    // Only pay for a DOM merge when the underlying set actually changed.
+    if (local.length !== media.length) mergeMedia(local);
+    else updatePill();
+  } catch {
+    /* DOM may be unavailable */
+  } finally {
+    scanBusy = false;
   }
 }
 
@@ -595,16 +762,33 @@ function scanPage() {
 /* boot                                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * True only in the top-level document.
+ *
+ * Media sniffing runs in every frame (players are very often iframed), but the
+ * floating panel, click interception and bulk-selection overlay belong to the
+ * top document only — otherwise a page with several frames paints dozens of
+ * duplicated overlays.
+ */
+const isTop = window === window.top;
+
 function applyState(next: ContentState | null | undefined) {
   if (!next) return;
-  if (next.settings) settings = next.settings;
+  if (next.settings) {
+    settings = next.settings;
+    // The bulk-selection overlay is installed once and toggled thereafter, so
+    // flipping the option does not require a page reload.
+    setBulkEnabled(!!isTop && settings.bulkSelect !== false);
+  }
   if (next.app) appState = next.app;
   renderPanel();
   updatePill();
 }
 
 export function setupContent() {
-  window.addEventListener("click", onClick, true);
+  if (isTop) {
+    window.addEventListener("click", onClick, true);
+  }
 
   chrome.runtime.onMessage.addListener((message: ContentMessage, _sender, sendResponse) => {
     switch (message?.type) {
@@ -631,11 +815,22 @@ export function setupContent() {
           name: message.name,
           sizeLabel: message.sizeLabel,
           defaultDir: message.defaultDir,
-          onYes: (dir) => {
-            void sendBg({ type: "ask.answer", notificationId: message.notificationId, choice: "xdl", dir });
+          onYes: (dir, remember) => {
+            void sendBg({
+              type: "ask.answer",
+              notificationId: message.notificationId,
+              choice: "xdl",
+              dir,
+              remember,
+            });
           },
-          onNo: () => {
-            void sendBg({ type: "ask.answer", notificationId: message.notificationId, choice: "browser" });
+          onNo: (remember) => {
+            void sendBg({
+              type: "ask.answer",
+              notificationId: message.notificationId,
+              choice: "browser",
+              remember,
+            });
           },
         });
         sendResponse?.({ ok: true });
@@ -654,11 +849,39 @@ export function setupContent() {
   });
 
   void (async () => {
+    // Crawlers (SEO bots, preview fetchers) must see untouched pages.
+    if (isCrawlerContext()) return;
+    // Signals that some player is actively feeding a MediaSource, which makes
+    // the manifest we already captured worth surfacing.
+    installMseObserver();
     const state = await sendBg<{ ok: boolean; state?: ContentState }>({ type: "state.get" });
     if (state?.state) applyState(state.state);
+    if (!isTop) {
+      // Sub-frame: sniff and report, but never build UI or intercept clicks.
+      scanPage();
+      return;
+    }
     const list = await sendBg<{ ok: boolean; candidates?: MediaCandidate[] }>({ type: "media.list" });
     if (list?.candidates) mergeMedia(list.candidates);
+    // Per-link badges and the bulk bar. Installed once; the settings toggle
+    // only gates it afterwards.
+    if (settings.bulkSelect !== false) {
+      installBulk();
+    }
     scanPage();
-    self.setInterval(scanPage, 4500);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) scanPage();
+    });
+    // Single-page apps swap the whole video without a navigation. Watching the
+    // resource timeline lets us notice and drop stale candidates.
+    let lastHref = location.href;
+    setInterval(() => {
+      if (location.href === lastHref) return;
+      lastHref = location.href;
+      resetExtractor();
+      media = [];
+      reported.clear();
+      scanPage();
+    }, 2000);
   })();
 }

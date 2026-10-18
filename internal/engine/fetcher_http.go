@@ -17,8 +17,8 @@ const (
 	MaxConnsNormal   = 16
 	MaxConnsTurbo    = 32
 	readBufSize      = 128 * 1024
-	writeBufSize    = 1 << 20 // coalesce WriteAt into 1 MiB batches
-	maxChunkRetries = 6
+	writeBufSize     = 1 << 20 // coalesce WriteAt into 1 MiB batches
+	maxChunkRetries  = 6
 	progressInterval = 250 * time.Millisecond
 	// readIdleTimeout bounds how long a chunk read may stall without progress.
 	readIdleTimeout = 45 * time.Second
@@ -58,9 +58,9 @@ func putWriteBuf(b *[]byte) { writeBufPool.Put(b) }
 // We probe for that method once; when it is absent we simply do nothing, so
 // behaviour degrades to the previous (no deadline) path.
 type readController struct {
-	body     io.ReadCloser
-	every    time.Duration
-	last     time.Time
+	body      io.ReadCloser
+	every     time.Duration
+	last      time.Time
 	supported bool
 }
 
@@ -111,6 +111,8 @@ func (c *readController) clear() {
 
 type DownloadOptions struct {
 	URL        string
+	Mirrors    []string // alternate URLs for the same bytes (multi-source race)
+	Proxy      string   // empty = environment; "direct" = no proxy
 	Dir        string
 	Name       string
 	Headers    http.Header
@@ -152,6 +154,17 @@ func NewHTTPDownloader() *HTTPDownloader {
 }
 
 func (d *HTTPDownloader) Download(ctx context.Context, opt DownloadOptions) (*DownloadResult, error) {
+	if opt.Proxy != "" {
+		probe, err := netx.WithProxy(d.probeClient, opt.Proxy)
+		if err != nil {
+			return nil, NewTaskError(ErrCodeNetwork, err.Error(), "检查任务代理地址")
+		}
+		data, err := netx.WithProxy(d.dataClient, opt.Proxy)
+		if err != nil {
+			return nil, NewTaskError(ErrCodeNetwork, err.Error(), "检查任务代理地址")
+		}
+		d = &HTTPDownloader{probeClient: probe, dataClient: data}
+	}
 	if opt.Conns <= 0 {
 		opt.Conns = DefaultConns
 	}
@@ -163,10 +176,25 @@ func (d *HTTPDownloader) Download(ctx context.Context, opt DownloadOptions) (*Do
 		opt.Conns = maxConns
 	}
 
-	probe, err := Probe(ctx, d.probeClient, opt.URL, opt.Headers)
+	var probe *ProbeResult
+	var sources *sourceBank
+	var err error
+	if len(opt.Mirrors) > 0 {
+		probe, sources, err = resolveMirrors(ctx, d.probeClient, opt.URL, opt.Mirrors, opt.Headers)
+	} else {
+		probe, err = Probe(ctx, d.probeClient, opt.URL, opt.Headers)
+		sources = newSourceBank(opt.URL, nil)
+		if probe != nil && probe.FinalURL != "" {
+			sources = newSourceBank(probe.FinalURL, nil)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
+
+	// First-packet tuning: shrink/expand initial width from size + sample speed.
+	opt.Conns = SuggestConns(probe, opt.Conns, opt.Turbo)
+
 	if opt.OnProbe != nil {
 		if err := opt.OnProbe(probe, &opt); err != nil {
 			return nil, err
@@ -223,17 +251,26 @@ func (d *HTTPDownloader) Download(ctx context.Context, opt DownloadOptions) (*Do
 		return nil, err
 	}
 
+	writer := newDiskWriter(file)
 	single := probe.SingleStream || !probe.AcceptRanges || probe.Size <= 0 || probe.Size < MinChunkSize
 	if single {
-		err = d.downloadSingle(ctx, file, probe, opt)
+		err = d.downloadSingle(ctx, writer, probe, opt, sources)
 	} else {
-		err = d.downloadMulti(ctx, file, probe, opt)
+		err = d.downloadMulti(ctx, writer, probe, opt, sources)
 	}
 
+	flushErr := writer.Flush()
+	closeWriterErr := writer.Close()
 	syncErr := file.Sync()
 	closeErr := file.Close()
 	if err != nil {
 		return nil, err
+	}
+	if flushErr != nil {
+		return nil, flushErr
+	}
+	if closeWriterErr != nil {
+		return nil, closeWriterErr
 	}
 	if syncErr != nil {
 		return nil, syncErr
@@ -253,10 +290,17 @@ func (d *HTTPDownloader) Download(ctx context.Context, opt DownloadOptions) (*Do
 		}
 	}
 
+	finalURL := probe.FinalURL
+	if sources != nil {
+		if u := sources.Pick(); u != "" {
+			finalURL = u
+		}
+	}
+
 	return &DownloadResult{
 		Path:     finalPath,
 		Size:     size,
-		FinalURL: probe.FinalURL,
+		FinalURL: finalURL,
 		Name:     name,
 	}, nil
 }
@@ -317,8 +361,14 @@ func (g *gate) wait(ctx context.Context) {
 	}
 }
 
-func (d *HTTPDownloader) downloadSingle(ctx context.Context, file *os.File, probe *ProbeResult, opt DownloadOptions) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probe.FinalURL, nil)
+func (d *HTTPDownloader) downloadSingle(ctx context.Context, writer *diskWriter, probe *ProbeResult, opt DownloadOptions, sources *sourceBank) error {
+	url := probe.FinalURL
+	if sources != nil {
+		if u := sources.Pick(); u != "" {
+			url = u
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
@@ -330,11 +380,17 @@ func (d *HTTPDownloader) downloadSingle(ctx context.Context, file *os.File, prob
 
 	resp, err := d.dataClient.Do(req)
 	if err != nil {
+		if sources != nil {
+			sources.ReportFailure(url)
+		}
 		return NewTaskError(ErrCodeNetwork, err.Error(), "检查网络后重试")
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		if sources != nil {
+			sources.ReportFailure(url)
+		}
 		return classifyHTTP(resp.StatusCode)
 	}
 
@@ -342,7 +398,6 @@ func (d *HTTPDownloader) downloadSingle(ctx context.Context, file *os.File, prob
 	defer putReadBuf(bufp)
 	buf := *bufp
 	wbufp := getWriteBuf()
-	defer putWriteBuf(wbufp)
 	wbuf := *wbufp
 	var written int64
 	var pending int
@@ -357,12 +412,17 @@ func (d *HTTPDownloader) downloadSingle(ctx context.Context, file *os.File, prob
 		if err := waitLimiters(ctx, opt, pending); err != nil {
 			return err
 		}
-		if _, err := file.WriteAt(wbuf[:pending], written); err != nil {
+		off := written
+		n := pending
+		submit := wbufp
+		wbufp = getWriteBuf()
+		wbuf = *wbufp
+		pending = 0
+		if err := writer.Submit(ctx, submit, n, off); err != nil {
 			return err
 		}
-		written += int64(pending)
-		windowBytes += int64(pending)
-		pending = 0
+		written += int64(n)
+		windowBytes += int64(n)
 		return nil
 	}
 
@@ -410,11 +470,27 @@ func (d *HTTPDownloader) downloadSingle(ctx context.Context, file *os.File, prob
 		}
 		if readErr != nil {
 			_ = flush()
+			if sources != nil {
+				sources.ReportFailure(url)
+			}
 			return NewTaskError(ErrCodeNetwork, readErr.Error(), "连接中断，可断点续传重试")
 		}
 	}
 	if err := flush(); err != nil {
 		return err
+	}
+	if wbufp != nil {
+		putWriteBuf(wbufp)
+		wbufp = nil
+	}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+	if sources != nil && written > 0 {
+		elapsed := time.Since(windowStart).Seconds()
+		if elapsed > 0 {
+			sources.ReportSuccess(url, int64(float64(written)/elapsed))
+		}
 	}
 	if opt.OnProgress != nil {
 		opt.OnProgress(written, probe.Size, 0)
@@ -425,7 +501,7 @@ func (d *HTTPDownloader) downloadSingle(ctx context.Context, file *os.File, prob
 	return nil
 }
 
-func (d *HTTPDownloader) downloadMulti(ctx context.Context, file *os.File, probe *ProbeResult, opt DownloadOptions) error {
+func (d *HTTPDownloader) downloadMulti(ctx context.Context, writer *diskWriter, probe *ProbeResult, opt DownloadOptions, sources *sourceBank) error {
 	var plan *ChunkPlan
 	if len(opt.ResumeChunks) > 0 {
 		var err error
@@ -453,40 +529,23 @@ func (d *HTTPDownloader) downloadMulti(ctx context.Context, file *os.File, probe
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
 	var startMu sync.Mutex
-	started := 0
+	nextID := 0
 	gate := newGate()
 
-	progressDone := make(chan struct{})
-	go func() {
-		defer close(progressDone)
-		ticker := time.NewTicker(progressInterval)
-		defer ticker.Stop()
-		var lastDone int64
-		lastT := time.Now()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				done := plan.TotalDone()
-				elapsed := time.Since(lastT).Seconds()
-				var spd int64
-				if elapsed > 0 {
-					spd = int64(float64(done-lastDone) / elapsed)
-				}
-				lastDone, lastT = done, time.Now()
-				if opt.OnProgress != nil {
-					opt.OnProgress(done, probe.Size, spd)
-				}
-				// Keep the in-memory chunk snapshot fresh for pause/resume.
-				// Disk persistence is separately rate-limited in Manager.
-				emitChunks()
-				if plan.AllDone() {
-					return
-				}
-			}
+	maxConns := MaxConnsNormal
+	if opt.Turbo {
+		maxConns = MaxConnsTurbo
+	}
+	if opt.Conns < maxConns {
+		// Allow runtime ramp up to turbo/normal ceiling when speed plateaus.
+		maxConns = minInt(maxConns, opt.Conns*2)
+		if maxConns > MaxConnsTurbo {
+			maxConns = MaxConnsTurbo
 		}
-	}()
+		if !opt.Turbo && maxConns > MaxConnsNormal {
+			maxConns = MaxConnsNormal
+		}
+	}
 
 	runWorker := func(workerID int) {
 		defer wg.Done()
@@ -518,7 +577,7 @@ func (d *HTTPDownloader) downloadMulti(ctx context.Context, file *os.File, probe
 				}
 			}
 
-			err := d.fetchChunk(ctx, file, probe, opt, plan, chunk, gate, func(spd int64) {
+			err := d.fetchChunk(ctx, writer, probe, opt, plan, chunk, gate, sources, func(spd int64) {
 				statsMu.Lock()
 				stats[chunk.Index] = spd
 				statsMu.Unlock()
@@ -553,23 +612,56 @@ func (d *HTTPDownloader) downloadMulti(ctx context.Context, file *os.File, probe
 		}
 	}
 
-	launch := func(id int) {
+	launch := func() {
 		startMu.Lock()
-		started++
+		id := nextID
+		nextID++
 		startMu.Unlock()
 		wg.Add(1)
 		go runWorker(id)
 	}
 
-	// Start every worker immediately. The previous implementation opened only 4
-	// connections and added one every 2s, so reaching the configured width took
-	// 8s at the default 8 conns and 56s in turbo mode — crippling short and
-	// medium downloads, which are the common case. Overlapping connections are
-	// now guarded by `gate`, which backs off on 429/Retry-After instead of
-	// guessing a fixed ramp schedule.
-	for i := 0; i < opt.Conns; i++ {
-		launch(i)
+	initial := opt.Conns
+	if initial < 1 {
+		initial = 1
 	}
+	for i := 0; i < initial; i++ {
+		launch()
+	}
+	adapter := newConnAdapter(initial, maxConns, launch)
+
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		ticker := time.NewTicker(progressInterval)
+		defer ticker.Stop()
+		var lastDone int64
+		lastT := time.Now()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				done := plan.TotalDone()
+				elapsed := time.Since(lastT).Seconds()
+				var spd int64
+				if elapsed > 0 {
+					spd = int64(float64(done-lastDone) / elapsed)
+				}
+				lastDone, lastT = done, time.Now()
+				if opt.OnProgress != nil {
+					opt.OnProgress(done, probe.Size, spd)
+				}
+				adapter.Tick(done, probe.Size)
+				// Keep the in-memory chunk snapshot fresh for pause/resume.
+				// Disk persistence is separately rate-limited in Manager.
+				emitChunks()
+				if plan.AllDone() {
+					return
+				}
+			}
+		}
+	}()
 
 	doneCh := make(chan struct{})
 	go func() {
@@ -581,6 +673,9 @@ func (d *HTTPDownloader) downloadMulti(ctx context.Context, file *os.File, probe
 	case <-doneCh:
 		cancel()
 		<-progressDone
+		if err := writer.Flush(); err != nil {
+			return err
+		}
 		if !plan.AllDone() {
 			select {
 			case err := <-errCh:
@@ -597,18 +692,20 @@ func (d *HTTPDownloader) downloadMulti(ctx context.Context, file *os.File, probe
 		cancel()
 		<-doneCh
 		<-progressDone
+		_ = writer.Flush()
 		return err
 	}
 }
 
 func (d *HTTPDownloader) fetchChunk(
 	ctx context.Context,
-	file *os.File,
+	writer *diskWriter,
 	probe *ProbeResult,
 	opt DownloadOptions,
 	plan *ChunkPlan,
 	chunk *Chunk,
 	gate *gate,
+	sources *sourceBank,
 	onSpeed func(int64),
 ) error {
 	from := chunk.Start + chunk.Done
@@ -617,7 +714,14 @@ func (d *HTTPDownloader) fetchChunk(
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probe.FinalURL, nil)
+	url := probe.FinalURL
+	if sources != nil {
+		if u := sources.Pick(); u != "" {
+			url = u
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
@@ -635,22 +739,37 @@ func (d *HTTPDownloader) fetchChunk(
 
 	resp, err := d.dataClient.Do(req)
 	if err != nil {
+		if sources != nil {
+			sources.ReportFailure(url)
+		}
 		return NewTaskError(ErrCodeNetwork, err.Error(), "分片连接失败，将自动重试")
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusOK:
+		if sources != nil {
+			sources.ReportFailure(url)
+		}
 		return NewTaskError(ErrCodeRangeRejected, "服务器忽略 Range", "将降级为单连接")
 	case http.StatusPartialContent:
 		if err := checkContentRange(resp.Header.Get("Content-Range"), from, to, probe.Size); err != nil {
+			if sources != nil {
+				sources.ReportFailure(url)
+			}
 			return err
 		}
 	case 429, 503:
 		// Back the whole connection set off, not just this chunk.
 		gate.trip(parseRetryAfter(resp.Header.Get("Retry-After")))
+		if sources != nil {
+			sources.ReportFailure(url)
+		}
 		return NewTaskError(ErrCodeNetwork, "请求过于频繁", "自动降速重试")
 	default:
+		if sources != nil {
+			sources.ReportFailure(url)
+		}
 		return classifyHTTP(resp.StatusCode)
 	}
 
@@ -658,7 +777,6 @@ func (d *HTTPDownloader) fetchChunk(
 	defer putReadBuf(bufp)
 	buf := *bufp
 	wbufp := getWriteBuf()
-	defer putWriteBuf(wbufp)
 	wbuf := *wbufp
 
 	offset := from
@@ -669,10 +787,11 @@ func (d *HTTPDownloader) fetchChunk(
 
 	_, curEnd, ok := plan.CurrentEnd(chunk.Index)
 	if !ok {
+		putWriteBuf(wbufp)
 		return NewTaskError(ErrCodeInternal, "分片不存在", "请重试")
 	}
 
-	// flush writes coalesced bytes, never past curEnd (TrySteal may shrink it).
+	// flush submits coalesced bytes to the disk writer, never past curEnd.
 	flush := func() error {
 		if pending > 0 {
 			maxWrite := curEnd - offset + 1
@@ -686,13 +805,26 @@ func (d *HTTPDownloader) fetchChunk(
 				if err := waitLimiters(ctx, opt, writeN); err != nil {
 					return err
 				}
-				if _, err := file.WriteAt(wbuf[:writeN], offset); err != nil {
+				submit := wbufp
+				if writeN < pending {
+					// Only a prefix is valid; copy into a fresh pooled buffer.
+					submit = getWriteBuf()
+					copy((*submit)[:writeN], wbuf[:writeN])
+					// Compact remainder back to start of current buffer.
+					copy(wbuf, wbuf[writeN:pending])
+					pending -= writeN
+				} else {
+					wbufp = getWriteBuf()
+					wbuf = *wbufp
+					pending = 0
+				}
+				off := offset
+				if err := writer.Submit(ctx, submit, writeN, off); err != nil {
 					return err
 				}
 				offset += int64(writeN)
 				downloaded = offset - chunk.Start
 				windowBytes += int64(writeN)
-				pending = 0
 			}
 		}
 		var ok2 bool
@@ -701,7 +833,11 @@ func (d *HTTPDownloader) fetchChunk(
 			return NewTaskError(ErrCodeInternal, "分片不存在", "请重试")
 		}
 		if elapsed := time.Since(windowStart).Seconds(); elapsed >= 0.5 && onSpeed != nil && windowBytes > 0 {
-			onSpeed(int64(float64(windowBytes) / elapsed))
+			bps := int64(float64(windowBytes) / elapsed)
+			onSpeed(bps)
+			if sources != nil {
+				sources.ReportSuccess(url, bps)
+			}
 			windowStart = time.Now()
 			windowBytes = 0
 		}
@@ -718,6 +854,10 @@ func (d *HTTPDownloader) fetchChunk(
 		}
 		if offset > curEnd {
 			_ = flush()
+			if wbufp != nil {
+				putWriteBuf(wbufp)
+				wbufp = nil
+			}
 			return nil
 		}
 
@@ -727,12 +867,19 @@ func (d *HTTPDownloader) fetchChunk(
 			_, curEnd, ok = plan.CurrentEnd(chunk.Index)
 			if !ok {
 				_ = flush()
+				if wbufp != nil {
+					putWriteBuf(wbufp)
+				}
 				return NewTaskError(ErrCodeInternal, "分片不存在", "请重试")
 			}
 			remain := curEnd - offset - int64(pending) + 1
 			if remain <= 0 {
 				if err := flush(); err != nil {
 					return err
+				}
+				if wbufp != nil {
+					putWriteBuf(wbufp)
+					wbufp = nil
 				}
 				return nil
 			}
@@ -755,6 +902,10 @@ func (d *HTTPDownloader) fetchChunk(
 						return err
 					}
 					if offset > curEnd {
+						if wbufp != nil {
+							putWriteBuf(wbufp)
+							wbufp = nil
+						}
 						return nil
 					}
 				}
@@ -765,12 +916,26 @@ func (d *HTTPDownloader) fetchChunk(
 		}
 		if readErr != nil {
 			_ = flush()
+			if wbufp != nil {
+				putWriteBuf(wbufp)
+				wbufp = nil
+			}
+			if sources != nil {
+				sources.ReportFailure(url)
+			}
 			return NewTaskError(ErrCodeNetwork, readErr.Error(), "分片中断，将重试")
 		}
 	}
 
 	if err := flush(); err != nil {
+		if wbufp != nil {
+			putWriteBuf(wbufp)
+		}
 		return err
+	}
+	if wbufp != nil {
+		putWriteBuf(wbufp)
+		wbufp = nil
 	}
 	need := curEnd - from + 1
 	if need < 0 {
@@ -778,6 +943,9 @@ func (d *HTTPDownloader) fetchChunk(
 	}
 	if offset-from < need {
 		plan.UpdateProgress(chunk.Index, downloaded)
+		if sources != nil {
+			sources.ReportFailure(url)
+		}
 		return NewTaskError(ErrCodeNetwork, "分片不完整", "将重试该分片")
 	}
 	return nil

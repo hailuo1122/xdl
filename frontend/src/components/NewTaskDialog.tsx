@@ -64,6 +64,11 @@ export function NewTaskDialog({
   const [name, setName] = useState("");
   const [dir, setDir] = useState(defaultDir);
   const [conns, setConns] = useState(defaultConns);
+  const [priority, setPriority] = useState(0);
+  const [limitBps, setLimitBps] = useState(0);
+  const [expectedSha256, setExpectedSha256] = useState("");
+  const [mirrors, setMirrors] = useState("");
+  const [proxy, setProxy] = useState("");
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -86,6 +91,11 @@ export function NewTaskDialog({
     setName("");
     setDir(defaultDir);
     setConns(defaultConns);
+    setPriority(0);
+    setLimitBps(0);
+    setExpectedSha256("");
+    setMirrors("");
+    setProxy("");
     setAdvanced(false);
     setBusy(false);
     setProbing(false);
@@ -277,13 +287,29 @@ export function NewTaskDialog({
             kind: probe?.kind || (url.toLowerCase().includes(".mpd") ? "dash" : "hls"),
             variantId: picked?.id,
             label: picked?.label,
+            priority: priority || undefined,
+            limitBps: limitBps || undefined,
+            expectedSha256: expectedSha256.trim() || undefined,
+            proxy: proxy.trim() || undefined,
           });
         } else {
+          const mirrorList =
+            lines.length === 1
+              ? mirrors
+                  .split(/\r?\n/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+              : undefined;
           t = await api.add({
             url,
             name: lines.length === 1 ? name.trim() : undefined,
             dir: dir || undefined,
             conns,
+            priority: priority || undefined,
+            limitBps: limitBps || undefined,
+            expectedSha256: expectedSha256.trim() || undefined,
+            mirrors: mirrorList,
+            proxy: proxy.trim() || undefined,
           });
         }
         added.push(t);
@@ -669,6 +695,73 @@ export function NewTaskDialog({
                 />
               </label>
             )}
+            <label className="field">
+              <span className="field-label">优先级</span>
+              <Select
+                aria-label="优先级"
+                value={priority}
+                onChange={setPriority}
+                options={[
+                  { value: 2, label: "高" },
+                  { value: 0, label: "普通" },
+                  { value: -1, label: "低" },
+                ]}
+              />
+            </label>
+            {!singleTorrent && (
+              <label className="field">
+                <span className="field-label">单任务限速</span>
+                <Select
+                  aria-label="单任务限速"
+                  value={limitBps}
+                  onChange={setLimitBps}
+                  options={[
+                    { value: 0, label: "不限速" },
+                    { value: 512 * 1024, label: "512 KB/s" },
+                    { value: 1 << 20, label: "1 MB/s" },
+                    { value: 3 << 20, label: "3 MB/s" },
+                    { value: 5 << 20, label: "5 MB/s" },
+                  ]}
+                />
+              </label>
+            )}
+            {lines.length === 1 && !singleTorrent && !singleMedia && (
+              <label className="field" style={{ gridColumn: "1 / -1" }}>
+                <span className="field-label">镜像地址（可选，一行一个）</span>
+                <TextArea
+                  value={mirrors}
+                  onChange={(e) => setMirrors(e.target.value)}
+                  placeholder={"同一文件的其他 http(s) 或 ftp 地址"}
+                  spellCheck={false}
+                  rows={3}
+                  aria-label="镜像地址"
+                />
+              </label>
+            )}
+            {!singleTorrent && (
+              <label className="field" style={{ gridColumn: "1 / -1" }}>
+                <span className="field-label">任务代理（可选）</span>
+                <TextField
+                  value={proxy}
+                  onChange={(e) => setProxy(e.target.value)}
+                  placeholder="留空用环境代理；direct 为直连；或 http(s):// / socks5://"
+                  spellCheck={false}
+                  aria-label="任务代理"
+                />
+              </label>
+            )}
+            {!singleTorrent && !singleMedia && (
+              <label className="field" style={{ gridColumn: "1 / -1" }}>
+                <span className="field-label">期望 SHA-256（可选）</span>
+                <TextField
+                  value={expectedSha256}
+                  onChange={(e) => setExpectedSha256(e.target.value)}
+                  placeholder="网页声明的哈希，下载完成后自动校验"
+                  spellCheck={false}
+                  aria-label="期望 SHA-256"
+                />
+              </label>
+            )}
           </div>
         )}
 
@@ -692,7 +785,7 @@ export function NewTaskDialog({
         <p className="form-hint">
           {mode === "grab"
             ? "抓取遵守 robots.txt，默认同源、限速访问；预览勾选后再入队。不会绕过登录墙或 DRM。"
-            : "多行 / txt 导入会去重后批量入队；开启自动分类时按扩展名写入子目录。HLS/DASH/BT 行为与此前相同。"}
+            : "多行 / txt 导入会去重后批量入队。.meta4 / .metalink 会展开成多镜像任务。FTP 为单连接续传。SFTP 未接入。"}
         </p>
       </div>
     </Modal>

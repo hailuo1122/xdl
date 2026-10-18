@@ -28,7 +28,9 @@ func (d *MediaDownloader) Download(ctx context.Context, opt MediaRunOptions) (*M
 		Conns:      opt.Conns,
 		FFmpegPath: opt.FFmpegPath,
 		GlobalLim:  opt.GlobalLim,
+		TaskLim:    opt.TaskLim,
 		FinalPath:  opt.FinalPath,
+		Proxy:      opt.Proxy,
 		OnProgress: opt.OnProgress,
 		OnMeta: func(m job.Meta) error {
 			if opt.OnMeta == nil {
@@ -61,7 +63,9 @@ type MediaRunOptions struct {
 	Conns      int
 	FFmpegPath string
 	GlobalLim  *Limiter
+	TaskLim    *Limiter
 	FinalPath  string
+	Proxy      string
 	OnProgress func(done, total, speed int64)
 	OnMeta     func(json.RawMessage) error
 }

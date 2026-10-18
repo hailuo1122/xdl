@@ -39,7 +39,9 @@ type Options struct {
 	Conns      int
 	FFmpegPath string
 	GlobalLim  RateLimiter
+	TaskLim    RateLimiter
 	FinalPath  string
+	Proxy      string
 	OnProgress func(done, total, speed int64)
 	OnMeta     func(Meta) error
 }
@@ -55,13 +57,28 @@ type Result struct {
 // Downloader downloads HLS/DASH VOD segments then remuxes.
 type Downloader struct {
 	client *http.Client
+	probe  *http.Client
 }
 
 func NewDownloader() *Downloader {
-	return &Downloader{client: netx.NewDataClient(60 * time.Second)}
+	return &Downloader{
+		client: netx.NewDataClient(60 * time.Second),
+		probe:  netx.NewProbeClient(30 * time.Second),
+	}
 }
 
 func (d *Downloader) Download(ctx context.Context, opt Options) (*Result, error) {
+	if opt.Proxy != "" {
+		data, err := netx.WithProxy(d.client, opt.Proxy)
+		if err != nil {
+			return nil, err
+		}
+		probe, err := netx.WithProxy(d.probe, opt.Proxy)
+		if err != nil {
+			return nil, err
+		}
+		d = &Downloader{client: data, probe: probe}
+	}
 	if opt.Conns <= 0 {
 		opt.Conns = defaultSegConns
 	}
@@ -97,7 +114,7 @@ func (d *Downloader) downloadHLS(ctx context.Context, opt Options, meta Meta) (*
 	if mediaURL == "" {
 		mediaURL = opt.URL
 	}
-	body, finalURL, err := fetchText(ctx, netx.NewProbeClient(30*time.Second), mediaURL, opt.Headers)
+	body, finalURL, err := fetchText(ctx, d.probe, mediaURL, opt.Headers)
 	if err != nil {
 		return nil, err
 	}
@@ -108,10 +125,18 @@ func (d *Downloader) downloadHLS(ctx context.Context, opt Options, meta Meta) (*
 	mediaURL = finalURL
 	meta.MediaURL = mediaURL
 	meta.Protocol = "hls"
+	meta.Live = pl.Live
 	if pl.IsFMP4 {
 		meta.Container = "fmp4"
 	} else {
 		meta.Container = "ts"
+	}
+	if pl.Live {
+		if pl.IsFMP4 {
+			return nil, fmt.Errorf("直播 fMP4 HLS 暂不支持，请选择 MPEG-TS 清晰度或改用 VOD")
+		}
+		meta.LiveMode = "record"
+		return d.downloadHLSLive(ctx, opt, meta, mediaURL, pl)
 	}
 
 	segs := make([]segJob, 0, len(pl.Segments))
@@ -147,7 +172,7 @@ func (d *Downloader) downloadHLS(ctx context.Context, opt Options, meta Meta) (*
 }
 
 func (d *Downloader) downloadDASH(ctx context.Context, opt Options, meta Meta) (*Result, error) {
-	body, finalURL, err := fetchText(ctx, netx.NewProbeClient(30*time.Second), opt.URL, opt.Headers)
+	body, finalURL, err := fetchText(ctx, d.probe, opt.URL, opt.Headers)
 	if err != nil {
 		return nil, err
 	}
@@ -552,8 +577,11 @@ func (d *Downloader) fetchSegOnce(ctx context.Context, opt Options, seg segJob, 
 		return 0, fmt.Errorf("分片 HTTP %d", resp.StatusCode)
 	}
 	var reader io.Reader = resp.Body
+	if opt.TaskLim != nil {
+		reader = &limitedReader{ctx: ctx, r: reader, lim: opt.TaskLim}
+	}
 	if opt.GlobalLim != nil {
-		reader = &limitedReader{ctx: ctx, r: resp.Body, lim: opt.GlobalLim}
+		reader = &limitedReader{ctx: ctx, r: reader, lim: opt.GlobalLim}
 	}
 	data, err := io.ReadAll(reader)
 	if err != nil {

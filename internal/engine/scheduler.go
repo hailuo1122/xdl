@@ -48,6 +48,8 @@ type Manager struct {
 	chunkSnap    map[TaskID][]Chunk
 	chunkSavedAt map[TaskID]time.Time
 	pathHold     map[string]TaskID
+	taskLims     map[TaskID]*Limiter
+	rules        QueueRules
 }
 
 type runSlot struct {
@@ -90,6 +92,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		chunkSnap:    make(map[TaskID][]Chunk),
 		chunkSavedAt: make(map[TaskID]time.Time),
 		pathHold:     make(map[string]TaskID),
+		taskLims:     make(map[TaskID]*Limiter),
 	}
 	if err := m.load(); err != nil {
 		_ = m.Close()
@@ -113,6 +116,8 @@ type RuntimeConfig struct {
 	BTMaxPeers    int
 	BTUploadLimit int64
 	BTSeed        bool
+	DomainMax     int
+	ExtRules      []ExtRule
 }
 
 // ApplyConfig updates scheduling defaults for new work and the global limiter.
@@ -133,6 +138,12 @@ func (m *Manager) ApplyConfig(c RuntimeConfig) {
 	m.cfg.BTMaxPeers = c.BTMaxPeers
 	m.cfg.BTUploadLimit = c.BTUploadLimit
 	m.cfg.BTSeed = c.BTSeed
+	if c.DomainMax >= 0 {
+		m.rules.DomainMax = c.DomainMax
+	}
+	if c.ExtRules != nil {
+		m.rules.Ext = append([]ExtRule(nil), c.ExtRules...)
+	}
 	m.global.Set(c.GlobalLimit)
 	bt := m.btDL
 	btCfg := btConfigFrom(m.cfg)
@@ -177,7 +188,7 @@ func (m *Manager) PauseAll() int {
 	m.mu.Lock()
 	var ids []TaskID
 	for id, t := range m.tasks {
-		if t.State == StateQueued || t.State == StateRunning || t.State == StateResolving {
+		if t.State == StateQueued || t.State == StateRunning || t.State == StateResolving || t.State == StateVerifying {
 			ids = append(ids, id)
 		}
 	}
@@ -283,14 +294,19 @@ func (m *Manager) load() error {
 }
 
 type AddParams struct {
-	URL      string
-	Dir      string
-	Name     string
-	Headers  http.Header
-	Conns    int
-	Kind     Kind
-	KindMeta json.RawMessage
-	Category string
+	URL            string
+	Mirrors        []string
+	Proxy          string
+	Dir            string
+	Name           string
+	Headers        http.Header
+	Conns          int
+	Kind           Kind
+	KindMeta       json.RawMessage
+	Category       string
+	Priority       int
+	LimitBps       int64
+	ExpectedSHA256 string
 }
 
 func (m *Manager) Add(params AddParams) (*Task, error) {
@@ -308,19 +324,23 @@ func (m *Manager) Add(params AddParams) (*Task, error) {
 	id := newTaskID()
 	now := time.Now()
 	t := &Task{
-		ID:        id,
-		Kind:      params.Kind,
-		URL:       params.URL,
-		Dir:       dir,
-		Name:      params.Name,
-		State:     StateQueued,
-		Priority:  0,
-		Category:  params.Category,
-		Conns:     conns,
-		Headers:   params.Headers,
-		KindMeta:  params.KindMeta,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:             id,
+		Kind:           params.Kind,
+		URL:            params.URL,
+		Mirrors:        append([]string(nil), params.Mirrors...),
+		Proxy:          params.Proxy,
+		Dir:            dir,
+		Name:           params.Name,
+		State:          StateQueued,
+		Priority:       params.Priority,
+		LimitBps:       params.LimitBps,
+		ExpectedSHA256: NormalizeOrEmpty(params.ExpectedSHA256),
+		Category:       params.Category,
+		Conns:          conns,
+		Headers:        params.Headers,
+		KindMeta:       params.KindMeta,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	m.mu.Lock()
 	m.tasks[id] = t
@@ -369,13 +389,15 @@ func (m *Manager) Pause(id TaskID) error {
 		m.mu.Unlock()
 		return nil
 	}
-	if running {
+	if running || t.State == StateVerifying {
 		// Invalidate in-flight run so its cleanup cannot overwrite a later Resume.
 		m.runGen[id]++
-		delete(m.running, id)
-		m.active--
-		if m.active < 0 {
-			m.active = 0
+		if running {
+			delete(m.running, id)
+			m.active--
+			if m.active < 0 {
+				m.active = 0
+			}
 		}
 	}
 	t.State = StatePaused
@@ -441,6 +463,7 @@ func (m *Manager) Remove(id TaskID) error {
 	delete(m.chunkSnap, id)
 	delete(m.chunkSavedAt, id)
 	delete(m.runGen, id)
+	delete(m.taskLims, id)
 	m.queue = removeTaskID(m.queue, id)
 	m.releasePathLocked(id)
 	bt := m.btDL
@@ -473,22 +496,46 @@ func (m *Manager) kick() {
 	if m.hold {
 		return
 	}
-	for m.active < m.cfg.MaxConcurrent && len(m.queue) > 0 {
-		id := m.queue[0]
-		m.queue = m.queue[1:]
-		t, ok := m.tasks[id]
-		if !ok || t.State != StateQueued {
-			continue
+	for m.active < m.cfg.MaxConcurrent {
+		orig := append([]TaskID(nil), m.queue...)
+		kept := make([]TaskID, 0, len(orig))
+		var picked TaskID
+		bestPri := 0
+		for _, id := range orig {
+			t, ok := m.tasks[id]
+			if !ok || t.State != StateQueued {
+				continue
+			}
+			kept = append(kept, id)
+			if !m.canStartLocked(t) {
+				continue
+			}
+			if picked == "" || t.Priority > bestPri {
+				picked = id
+				bestPri = t.Priority
+			}
 		}
+		m.queue = kept
+		if picked == "" {
+			return
+		}
+		next := m.queue[:0]
+		for _, id := range m.queue {
+			if id != picked {
+				next = append(next, id)
+			}
+		}
+		m.queue = next
+		t := m.tasks[picked]
 		ctx, cancel := context.WithCancel(context.Background())
-		m.runGen[id]++
-		gen := m.runGen[id]
+		m.runGen[picked]++
+		gen := m.runGen[picked]
 		done := make(chan struct{})
-		m.running[id] = &runSlot{cancel: cancel, gen: gen, done: done}
+		m.running[picked] = &runSlot{cancel: cancel, gen: gen, done: done}
 		m.active++
 		t.State = StateRunning
 		t.UpdatedAt = time.Now()
-		go m.runTask(ctx, id, gen, done)
+		go m.runTask(ctx, picked, gen, done)
 	}
 }
 
@@ -527,14 +574,22 @@ func (m *Manager) runTask(ctx context.Context, id TaskID, gen uint64, done chan 
 		return
 	}
 
+	if t.Kind == KindFTP {
+		m.runFTPTask(ctx, id, gen, t)
+		return
+	}
+
 	opt := DownloadOptions{
 		URL:       t.URL,
+		Mirrors:   append([]string(nil), t.Mirrors...),
+		Proxy:     t.Proxy,
 		Dir:       t.Dir,
 		Name:      t.Name,
 		Headers:   t.Headers,
 		Conns:     t.Conns,
 		Turbo:     m.cfg.Turbo,
 		GlobalLim: m.global,
+		TaskLim:   m.taskLimiter(id, t.LimitBps),
 		FinalPath: t.FinalPath,
 		PartPath:  t.PartPath,
 		OnProgress: func(done, total, speed int64) {
@@ -572,6 +627,9 @@ func (m *Manager) runTask(ctx context.Context, id TaskID, gen uint64, done chan 
 			o.Name = name
 			cur.FinalURL = probe.FinalURL
 			cur.Size = probe.Size
+			if o.Conns > 0 {
+				cur.Conns = o.Conns
+			}
 
 			if cur.FinalPath == "" {
 				fp, err := m.claimPathLocked(id, cur.Dir, name)
@@ -623,6 +681,9 @@ func (m *Manager) runTask(ctx context.Context, id TaskID, gen uint64, done chan 
 				}
 			}
 			cur.Validator = newVal
+			if cur.ExpectedSHA256 == "" && probe.SHA256 != "" {
+				cur.ExpectedSHA256 = probe.SHA256
+			}
 			tcp := *cur
 			m.mu.Unlock()
 			_ = m.store.PutTask(&tcp)
@@ -645,7 +706,10 @@ func (m *Manager) runTask(ctx context.Context, id TaskID, gen uint64, done chan 
 	}
 
 	res, err := m.httpDL.Download(ctx, opt)
+	m.finishDownload(ctx, id, gen, res, err)
+}
 
+func (m *Manager) finishDownload(ctx context.Context, id TaskID, gen uint64, res *DownloadResult, err error) {
 	if ctx.Err() != nil {
 		m.persistChunks(id, true)
 		m.setStateIfGen(id, gen, StatePaused, nil)
@@ -677,7 +741,7 @@ func (m *Manager) runTask(ctx context.Context, id TaskID, gen uint64, done chan 
 	}
 	m.mu.Unlock()
 	_ = m.store.DeleteChunks(id)
-	m.setStateIfGen(id, gen, StateDone, nil)
+	m.finishFile(ctx, id, gen, res.Path)
 }
 
 func (m *Manager) runMediaTask(ctx context.Context, id TaskID, gen uint64, t *Task) {
@@ -734,6 +798,8 @@ func (m *Manager) runMediaTask(ctx context.Context, id TaskID, gen uint64, t *Ta
 	conns := cur.Conns
 	url := cur.URL
 	ffmpeg := m.cfg.FFmpegPath
+	limitBps := cur.LimitBps
+	proxy := cur.Proxy
 	tcp := *cur
 	m.mu.Unlock()
 	_ = m.store.PutTask(&tcp)
@@ -747,7 +813,9 @@ func (m *Manager) runMediaTask(ctx context.Context, id TaskID, gen uint64, t *Ta
 		Conns:      conns,
 		FFmpegPath: ffmpeg,
 		GlobalLim:  m.global,
+		TaskLim:    m.taskLimiter(id, limitBps),
 		FinalPath:  finalPath,
+		Proxy:      proxy,
 		OnProgress: progress,
 		OnMeta: func(raw json.RawMessage) error {
 			m.mu.Lock()
@@ -767,33 +835,43 @@ func (m *Manager) runMediaTask(ctx context.Context, id TaskID, gen uint64, t *Ta
 		},
 	})
 
+	if err == nil && res != nil {
+		// Accept gen or gen+1 so live "stop recording" can finish after Pause cancels.
+		m.mu.Lock()
+		curGen := m.runGen[id]
+		okGen := curGen == gen || curGen == gen+1
+		if okGen {
+			if cur, ok := m.tasks[id]; ok {
+				cur.Name = res.Name
+				cur.FinalURL = res.FinalURL
+				cur.FinalPath = res.Path
+				cur.PartPath = ""
+				cur.Size = res.Size
+				cur.Done = res.Size
+				cur.Speed = 0
+				cur.State = StateDone
+				cur.Err = nil
+				cur.UpdatedAt = time.Now()
+				cp := *cur
+				m.releasePathLocked(id)
+				m.mu.Unlock()
+				_ = m.store.PutTask(&cp)
+				m.bus.Publish(Event{Type: EventTaskUpdated, Data: &cp})
+				return
+			}
+		}
+		m.mu.Unlock()
+		return
+	}
 	if ctx.Err() != nil {
 		m.setStateIfGen(id, gen, StatePaused, nil)
 		return
 	}
-	if err != nil {
-		te, ok := err.(*TaskError)
-		if !ok {
-			te = NewTaskError(ErrCodeInternal, err.Error(), "检查播放列表或 Cookie 后重试")
-		}
-		m.setStateIfGen(id, gen, StateFailed, te)
-		return
+	te, ok := err.(*TaskError)
+	if !ok {
+		te = NewTaskError(ErrCodeInternal, err.Error(), "检查播放列表或 Cookie 后重试")
 	}
-	m.mu.Lock()
-	if m.runGen[id] == gen {
-		if cur, ok := m.tasks[id]; ok {
-			cur.Name = res.Name
-			cur.FinalURL = res.FinalURL
-			cur.FinalPath = res.Path
-			cur.PartPath = ""
-			cur.Size = res.Size
-			cur.Done = res.Size
-			cur.Speed = 0
-		}
-		m.releasePathLocked(id)
-	}
-	m.mu.Unlock()
-	m.setStateIfGen(id, gen, StateDone, nil)
+	m.setStateIfGen(id, gen, StateFailed, te)
 }
 
 func (m *Manager) runTorrentTask(ctx context.Context, id TaskID, gen uint64, t *Task) {
@@ -902,6 +980,129 @@ func (m *Manager) runTorrentTask(ctx context.Context, id TaskID, gen uint64, t *
 	m.setStateIfGen(id, gen, StateDone, nil)
 }
 
+func (m *Manager) taskLimiter(id TaskID, bps int64) *Limiter {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if bps <= 0 {
+		delete(m.taskLims, id)
+		return nil
+	}
+	if lim, ok := m.taskLims[id]; ok {
+		lim.Set(bps)
+		return lim
+	}
+	lim := NewLimiter(bps)
+	m.taskLims[id] = lim
+	return lim
+}
+
+// SetPriority changes queue ordering (higher starts first).
+func (m *Manager) SetPriority(id TaskID, priority int) error {
+	m.mu.Lock()
+	t, ok := m.tasks[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("not found")
+	}
+	if priority > 10 {
+		priority = 10
+	}
+	if priority < -10 {
+		priority = -10
+	}
+	t.Priority = priority
+	t.UpdatedAt = time.Now()
+	cp := *t
+	m.mu.Unlock()
+	_ = m.store.PutTask(&cp)
+	m.bus.Publish(Event{Type: EventTaskUpdated, Data: &cp})
+	m.kick()
+	return nil
+}
+
+// SetLimitBps sets a per-task download cap (0 = unlimited beyond global).
+func (m *Manager) SetLimitBps(id TaskID, bps int64) error {
+	if bps < 0 {
+		bps = 0
+	}
+	if bps > 0 && bps < 32*1024 {
+		bps = 32 * 1024
+	}
+	m.mu.Lock()
+	t, ok := m.tasks[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("not found")
+	}
+	t.LimitBps = bps
+	t.UpdatedAt = time.Now()
+	if lim, exists := m.taskLims[id]; exists {
+		lim.Set(bps)
+		if bps <= 0 {
+			delete(m.taskLims, id)
+		}
+	}
+	cp := *t
+	m.mu.Unlock()
+	_ = m.store.PutTask(&cp)
+	m.bus.Publish(Event{Type: EventTaskUpdated, Data: &cp})
+	return nil
+}
+
+func (m *Manager) finishFile(ctx context.Context, id TaskID, gen uint64, path string) {
+	m.mu.Lock()
+	if m.runGen[id] != gen {
+		m.mu.Unlock()
+		return
+	}
+	t := m.tasks[id]
+	expected := ""
+	if t != nil {
+		expected = t.ExpectedSHA256
+	}
+	m.mu.Unlock()
+	if expected == "" || path == "" {
+		m.setStateIfGen(id, gen, StateDone, nil)
+		return
+	}
+	if !m.setStateIfGen(id, gen, StateVerifying, nil) {
+		return
+	}
+	sum, err := HashFile(ctx, path)
+	if ctx.Err() != nil {
+		m.setStateIfGen(id, gen, StatePaused, nil)
+		return
+	}
+	if err != nil {
+		m.setStateIfGen(id, gen, StateFailed, NewTaskError(ErrCodeChecksum, err.Error(), "无法读取已下载文件做校验"))
+		return
+	}
+	m.mu.Lock()
+	if m.runGen[id] == gen {
+		if cur, ok := m.tasks[id]; ok {
+			cur.SHA256 = sum
+			cp := *cur
+			m.mu.Unlock()
+			_ = m.store.PutTask(&cp)
+			m.bus.Publish(Event{Type: EventTaskUpdated, Data: &cp})
+		} else {
+			m.mu.Unlock()
+		}
+	} else {
+		m.mu.Unlock()
+		return
+	}
+	if !strings.EqualFold(sum, expected) {
+		m.setStateIfGen(id, gen, StateFailed, NewTaskError(
+			ErrCodeChecksum,
+			fmt.Sprintf("SHA-256 不匹配：期望 %s，实际 %s", expected, sum),
+			"删除文件后换源重试，或核对网页声明的哈希",
+		))
+		return
+	}
+	m.setStateIfGen(id, gen, StateDone, nil)
+}
+
 func newBTClient(cfg ManagerConfig) (*bittorrent.Client, error) {
 	return bittorrent.NewClient(btConfigFrom(cfg))
 }
@@ -918,7 +1119,6 @@ func btConfigFrom(cfg ManagerConfig) bittorrent.Config {
 func torrentInfoHash(raw json.RawMessage) string {
 	return bittorrent.DecodeMeta(raw).InfoHash
 }
-
 
 func (m *Manager) persistChunks(id TaskID, force bool) {
 	m.mu.Lock()
@@ -950,7 +1150,7 @@ func (m *Manager) setStateIfGen(id TaskID, gen uint64, state State, err *TaskErr
 		m.mu.Unlock()
 		return false
 	}
-	if state == StatePaused && t.State != StateRunning && t.State != StateResolving && t.State != StatePaused {
+	if state == StatePaused && t.State != StateRunning && t.State != StateResolving && t.State != StateVerifying && t.State != StatePaused {
 		m.mu.Unlock()
 		return false
 	}

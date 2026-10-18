@@ -8,7 +8,7 @@ import (
 	"github.com/grafov/m3u8"
 )
 
-// Media is a VOD media playlist. Live streams are rejected.
+// Media is a media playlist (VOD or live).
 type Media struct {
 	Segments     []Segment
 	Target       int
@@ -17,6 +17,7 @@ type Media struct {
 	MapByteStart int64
 	MapByteEnd   int64 // inclusive; -1 if whole resource
 	IsFMP4       bool
+	Live         bool // true when EXT-X-ENDLIST is absent
 }
 
 type Segment struct {
@@ -47,7 +48,7 @@ type Playlist struct {
 	Media    *Media
 }
 
-// Parse reads a master or media playlist. Live and SAMPLE-AES / DRM are rejected.
+// Parse reads a master or media playlist. SAMPLE-AES / DRM are rejected.
 func Parse(r io.Reader) (*Playlist, error) {
 	p, listType, err := m3u8.DecodeFrom(r, true)
 	if err != nil {
@@ -87,7 +88,7 @@ func Parse(r io.Reader) (*Playlist, error) {
 	}
 }
 
-// ParseMedia reads a media playlist and requires EXT-X-ENDLIST.
+// ParseMedia reads a media playlist (VOD or live).
 func ParseMedia(r io.Reader) (*Media, error) {
 	pl, err := Parse(r)
 	if err != nil {
@@ -99,15 +100,25 @@ func ParseMedia(r io.Reader) (*Media, error) {
 	return pl.Media, nil
 }
 
-func mediaFrom(pl *m3u8.MediaPlaylist) (*Media, error) {
-	if !pl.Closed {
+// ParseMediaVOD is ParseMedia but rejects live playlists.
+func ParseMediaVOD(r io.Reader) (*Media, error) {
+	m, err := ParseMedia(r)
+	if err != nil {
+		return nil, err
+	}
+	if m.Live {
 		return nil, fmt.Errorf("直播播放列表不受支持（缺少 EXT-X-ENDLIST）")
 	}
+	return m, nil
+}
+
+func mediaFrom(pl *m3u8.MediaPlaylist) (*Media, error) {
 	out := &Media{
 		Target:       int(pl.TargetDuration),
 		MediaSeq:     pl.SeqNo,
 		MapByteStart: -1,
 		MapByteEnd:   -1,
+		Live:         !pl.Closed,
 	}
 	if pl.Map != nil && pl.Map.URI != "" {
 		out.MapURI = pl.Map.URI

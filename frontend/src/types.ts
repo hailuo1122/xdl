@@ -29,6 +29,10 @@ export interface TaskView {
   speed: number;
   conns: number;
   category?: string;
+  priority?: number;
+  limitBps?: number;
+  expectedSha256?: string;
+  sha256?: string;
   validator: {
     etag?: string;
     lastModified?: string;
@@ -96,6 +100,9 @@ export interface Settings {
   aria2Enabled: boolean;
   aria2Port: number;
   aria2Secret: string;
+  watchClipboard: boolean;
+  domainConcurrency: number;
+  extPolicies?: { ext: string; action: string }[];
 }
 
 export interface BrowserIntegration {
@@ -144,6 +151,8 @@ export interface AppStatus {
 
 export interface AddRequest {
   url: string;
+  mirrors?: string[];
+  proxy?: string;
   dir?: string;
   name?: string;
   conns?: number;
@@ -155,6 +164,9 @@ export interface AddRequest {
   selected?: number[];
   seedAfter?: boolean;
   acceptLegal?: boolean;
+  priority?: number;
+  limitBps?: number;
+  expectedSha256?: string;
 }
 
 export interface TorrentFileInfo {

@@ -1,10 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -20,7 +22,9 @@ import (
 	"github.com/xdl-app/xdl/internal/engine"
 	"github.com/xdl-app/xdl/internal/ipc"
 	"github.com/xdl-app/xdl/internal/media/job"
+	"github.com/xdl-app/xdl/internal/metalink"
 	"github.com/xdl-app/xdl/internal/nativehost"
+	"github.com/xdl-app/xdl/internal/netx"
 	"github.com/xdl-app/xdl/internal/settings"
 )
 
@@ -125,6 +129,8 @@ func Open() (*Runtime, error) {
 		BTMaxPeers:    s.BTMaxPeers,
 		BTUploadLimit: s.BTUploadLimitBps,
 		BTSeed:        s.BTSeedAfterDone,
+		DomainMax:     s.DomainConcurrency,
+		ExtRules:      toEngineExtRules(s.ExtPolicies),
 	})
 	rt := &Runtime{
 		Mgr:      mgr,
@@ -229,30 +235,44 @@ func (rt *Runtime) SaveSettings(in settings.Settings) (settings.Settings, error)
 		BTMaxPeers:    s.BTMaxPeers,
 		BTUploadLimit: s.BTUploadLimitBps,
 		BTSeed:        s.BTSeedAfterDone,
+		DomainMax:     s.DomainConcurrency,
+		ExtRules:      toEngineExtRules(s.ExtPolicies),
 	})
 	rt.restartAria2()
 	return s, nil
 }
 
+func toEngineExtRules(in []settings.ExtPolicy) []engine.ExtRule {
+	out := make([]engine.ExtRule, 0, len(in))
+	for _, p := range in {
+		out = append(out, engine.ExtRule{Ext: p.Ext, Action: p.Action})
+	}
+	return out
+}
+
 // TaskView is the safe, UI-facing projection of a task (headers stay private).
 type TaskView struct {
-	ID        string            `json:"id"`
-	Kind      string            `json:"kind"`
-	URL       string            `json:"url"`
-	FinalURL  string            `json:"finalUrl,omitempty"`
-	Name      string            `json:"name"`
-	State     string            `json:"state"`
-	Dir       string            `json:"dir,omitempty"`
-	FinalPath string            `json:"finalPath,omitempty"`
-	Size      int64             `json:"size"`
-	Done      int64             `json:"done"`
-	Speed     int64             `json:"speed"`
-	Conns     int               `json:"conns"`
-	Category  string            `json:"category,omitempty"`
-	Validator engine.Validator  `json:"validator"`
-	Err       *engine.TaskError `json:"err,omitempty"`
-	CreatedAt time.Time         `json:"createdAt"`
-	UpdatedAt time.Time         `json:"updatedAt"`
+	ID             string            `json:"id"`
+	Kind           string            `json:"kind"`
+	URL            string            `json:"url"`
+	FinalURL       string            `json:"finalUrl,omitempty"`
+	Name           string            `json:"name"`
+	State          string            `json:"state"`
+	Dir            string            `json:"dir,omitempty"`
+	FinalPath      string            `json:"finalPath,omitempty"`
+	Size           int64             `json:"size"`
+	Done           int64             `json:"done"`
+	Speed          int64             `json:"speed"`
+	Conns          int               `json:"conns"`
+	Category       string            `json:"category,omitempty"`
+	Priority       int               `json:"priority"`
+	LimitBps       int64             `json:"limitBps,omitempty"`
+	ExpectedSHA256 string            `json:"expectedSha256,omitempty"`
+	SHA256         string            `json:"sha256,omitempty"`
+	Validator      engine.Validator  `json:"validator"`
+	Err            *engine.TaskError `json:"err,omitempty"`
+	CreatedAt      time.Time         `json:"createdAt"`
+	UpdatedAt      time.Time         `json:"updatedAt"`
 	// Torrent-only live stats from KindMeta.
 	Peers    int     `json:"peers,omitempty"`
 	Seeds    int     `json:"seeds,omitempty"`
@@ -265,23 +285,27 @@ func toView(t *engine.Task) TaskView {
 		return TaskView{}
 	}
 	v := TaskView{
-		ID:        string(t.ID),
-		Kind:      string(t.Kind),
-		URL:       t.URL,
-		FinalURL:  t.FinalURL,
-		Name:      t.Name,
-		State:     string(t.State),
-		Dir:       t.Dir,
-		FinalPath: t.FinalPath,
-		Size:      t.Size,
-		Done:      t.Done,
-		Speed:     t.Speed,
-		Conns:     t.Conns,
-		Category:  t.Category,
-		Validator: t.Validator,
-		Err:       t.Err,
-		CreatedAt: t.CreatedAt,
-		UpdatedAt: t.UpdatedAt,
+		ID:             string(t.ID),
+		Kind:           string(t.Kind),
+		URL:            t.URL,
+		FinalURL:       t.FinalURL,
+		Name:           t.Name,
+		State:          string(t.State),
+		Dir:            t.Dir,
+		FinalPath:      t.FinalPath,
+		Size:           t.Size,
+		Done:           t.Done,
+		Speed:          t.Speed,
+		Conns:          t.Conns,
+		Category:       t.Category,
+		Priority:       t.Priority,
+		LimitBps:       t.LimitBps,
+		ExpectedSHA256: t.ExpectedSHA256,
+		SHA256:         t.SHA256,
+		Validator:      t.Validator,
+		Err:            t.Err,
+		CreatedAt:      t.CreatedAt,
+		UpdatedAt:      t.UpdatedAt,
 	}
 	if t.Kind == engine.KindTorrent {
 		meta := bittorrent.DecodeMeta(t.KindMeta)
@@ -312,6 +336,8 @@ func (rt *Runtime) ListViews() []TaskView {
 // AddRequest is shared by the shell (trusted dir) and native host (sandboxed).
 type AddRequest struct {
 	URL           string            `json:"url"`
+	Mirrors       []string          `json:"mirrors,omitempty"` // same-content alternate URLs
+	Proxy         string            `json:"proxy,omitempty"`   // http(s), socks5, or "direct"
 	Dir           string            `json:"dir,omitempty"`
 	Name          string            `json:"name,omitempty"`
 	Conns         int               `json:"conns,omitempty"`
@@ -325,11 +351,14 @@ type AddRequest struct {
 	Origin        string            `json:"origin,omitempty"`
 	Headers       map[string]string `json:"headers,omitempty"`
 	// Torrent fields (trusted shell / torrent.start).
-	InfoHash    string `json:"infoHash,omitempty"`
-	TorrentPath string `json:"torrentPath,omitempty"`
-	Selected    []int  `json:"selected,omitempty"`
-	SeedAfter   *bool  `json:"seedAfter,omitempty"`
-	AcceptLegal bool   `json:"acceptLegal,omitempty"`
+	InfoHash       string `json:"infoHash,omitempty"`
+	TorrentPath    string `json:"torrentPath,omitempty"`
+	Selected       []int  `json:"selected,omitempty"`
+	SeedAfter      *bool  `json:"seedAfter,omitempty"`
+	AcceptLegal    bool   `json:"acceptLegal,omitempty"`
+	Priority       int    `json:"priority,omitempty"`
+	LimitBps       int64  `json:"limitBps,omitempty"`
+	ExpectedSHA256 string `json:"expectedSha256,omitempty"`
 }
 
 var headerAllowlist = map[string]struct{}{
@@ -474,6 +503,49 @@ func (rt *Runtime) FindDuplicate(rawURL, dir, name string) *TaskView {
 	return &v
 }
 
+func mirrorFamily(raw string) string {
+	if hasPrefixFold(raw, "ftp://") {
+		return "ftp"
+	}
+	if hasPrefixFold(raw, "http://") || hasPrefixFold(raw, "https://") {
+		return "http"
+	}
+	return ""
+}
+
+// sanitizeMirrors keeps same-scheme alternates, drops duplicates of the primary URL,
+// and caps the list so a hostile client cannot flood probe goroutines.
+func sanitizeMirrors(primary string, mirrors []string) []string {
+	if len(mirrors) == 0 {
+		return nil
+	}
+	prim := normalizeURLForCompare(primary)
+	seen := map[string]struct{}{prim: {}}
+	out := make([]string, 0, len(mirrors))
+	for _, m := range mirrors {
+		m = strings.TrimSpace(m)
+		if !safeURL(m) || strings.HasPrefix(strings.ToLower(m), "magnet:") {
+			continue
+		}
+		if mirrorFamily(m) != mirrorFamily(primary) {
+			continue
+		}
+		key := normalizeURLForCompare(m)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, m)
+		if len(out) >= 7 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func sanitizeName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -577,8 +649,25 @@ func (rt *Runtime) ChooseDir() (string, error) {
 // only set Dir to the default download tree or a folder freshly picked via fs.chooseDir.
 func (rt *Runtime) Add(req AddRequest, trusted bool) (*TaskView, error) {
 	u := strings.TrimSpace(req.URL)
+	if hasPrefixFold(u, "sftp://") {
+		return nil, fmt.Errorf("SFTP 未接入：当前没有远程目录场景，认证和主机密钥需要单独定")
+	}
+	proxy, err := netx.NormalizeProxy(req.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	req.Proxy = proxy
+	req.URL = u
+	if metalink.LooksLike(u) {
+		return rt.addMetalink(req, trusted)
+	}
+	return rt.addDirect(req, trusted)
+}
+
+func (rt *Runtime) addDirect(req AddRequest, trusted bool) (*TaskView, error) {
+	u := strings.TrimSpace(req.URL)
 	if !safeURL(u) {
-		return nil, fmt.Errorf("只接受 http、https 或 magnet 链接")
+		return nil, fmt.Errorf("只接受 http、https、ftp 或 magnet 链接")
 	}
 	if strings.HasPrefix(strings.ToLower(u), "magnet:") || req.Kind == string(engine.KindTorrent) {
 		return rt.TorrentStart(req, trusted)
@@ -603,8 +692,31 @@ func (rt *Runtime) Add(req AddRequest, trusted bool) (*TaskView, error) {
 	name := sanitizeName(req.Name)
 	var category string
 	dir, category = rt.applyCategory(u, name, dir)
+	s := rt.Settings()
+	action := settings.ExtAction(s.ExtPolicies, name)
+	if action == "normal" {
+		action = settings.ExtAction(s.ExtPolicies, u)
+	}
+	pri, skip := settings.PriorityFor(action)
+	if skip {
+		return nil, fmt.Errorf("扩展名策略跳过：%s", action)
+	}
+	if req.Priority != 0 {
+		pri = req.Priority
+	}
+	expected := ""
+	if raw := strings.TrimSpace(req.ExpectedSHA256); raw != "" {
+		sum, ok := engine.NormalizeSHA256(raw)
+		if !ok {
+			return nil, fmt.Errorf("SHA-256 格式无效（需要 64 位十六进制或标准 base64）")
+		}
+		expected = sum
+	}
 	kind := engine.Kind(strings.ToLower(strings.TrimSpace(req.Kind)))
 	var kindMeta json.RawMessage
+	if hasPrefixFold(u, "ftp://") {
+		kind = engine.KindFTP
+	}
 	switch kind {
 	case engine.KindHLS, engine.KindDASH:
 		raw, err := job.EncodeMeta(job.Meta{
@@ -630,28 +742,134 @@ func (rt *Runtime) Add(req AddRequest, trusted bool) (*TaskView, error) {
 		default:
 			kind = engine.KindHTTP
 		}
-	case engine.KindHTTP:
+	case engine.KindHTTP, engine.KindFTP:
 		// ok
 	case engine.KindTorrent:
 		return rt.TorrentStart(req, trusted)
 	default:
 		return nil, fmt.Errorf("不支持的任务类型：%s", kind)
 	}
+	mirrors := sanitizeMirrors(u, req.Mirrors)
 	t, err := rt.Mgr.Add(engine.AddParams{
-		URL:      u,
-		Dir:      dir,
-		Name:     name,
-		Headers:  h,
-		Conns:    req.Conns,
-		Kind:     kind,
-		KindMeta: kindMeta,
-		Category: category,
+		URL:            u,
+		Mirrors:        mirrors,
+		Proxy:          req.Proxy,
+		Dir:            dir,
+		Name:           name,
+		Headers:        h,
+		Conns:          req.Conns,
+		Kind:           kind,
+		KindMeta:       kindMeta,
+		Category:       category,
+		Priority:       pri,
+		LimitBps:       req.LimitBps,
+		ExpectedSHA256: expected,
 	})
 	if err != nil {
 		return nil, err
 	}
 	v := toView(t)
 	return &v, nil
+}
+
+func (rt *Runtime) addMetalink(req AddRequest, trusted bool) (*TaskView, error) {
+	h, err := req.headers()
+	if err != nil {
+		return nil, err
+	}
+	client := netx.NewProbeClient(30 * time.Second)
+	client, err = netx.WithProxy(client, req.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, vs := range h {
+		for _, v := range vs {
+			httpReq.Header.Add(k, v)
+		}
+	}
+	if httpReq.Header.Get("User-Agent") == "" {
+		httpReq.Header.Set("User-Agent", "XDL")
+	}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("读取 Metalink 失败：%w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("读取 Metalink 失败：HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取 Metalink 失败：%w", err)
+	}
+	if len(body) > 2<<20 {
+		return nil, fmt.Errorf("Metalink 文件过大")
+	}
+	doc, err := metalink.Parse(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var first *TaskView
+	var fails []string
+	for _, f := range doc.Files {
+		sub := req
+		sub.Mirrors = nil
+		sub.Kind = ""
+		httpURLs, ftpURLs := splitMirrorSchemes(f.URLs)
+		switch {
+		case len(httpURLs) > 0:
+			sub.URL = httpURLs[0]
+			sub.Mirrors = httpURLs[1:]
+		case len(ftpURLs) > 0:
+			sub.URL = ftpURLs[0]
+			sub.Mirrors = ftpURLs[1:]
+			sub.Kind = string(engine.KindFTP)
+		default:
+			fails = append(fails, f.Name+": 没有可用地址")
+			continue
+		}
+		if strings.TrimSpace(req.Name) == "" || len(doc.Files) != 1 {
+			sub.Name = f.Name
+		}
+		if strings.TrimSpace(req.ExpectedSHA256) == "" {
+			sub.ExpectedSHA256 = f.SHA256
+		}
+		v, err := rt.addDirect(sub, trusted)
+		if err != nil {
+			fails = append(fails, f.Name+": "+err.Error())
+			continue
+		}
+		if first == nil {
+			cp := *v
+			first = &cp
+		}
+	}
+	if first == nil {
+		if len(fails) == 0 {
+			return nil, fmt.Errorf("Metalink 里没有可用的文件地址")
+		}
+		return nil, fmt.Errorf("%s", fails[0])
+	}
+	return first, nil
+}
+
+func splitMirrorSchemes(urls []string) (httpURLs, ftpURLs []string) {
+	for _, u := range urls {
+		if hasPrefixFold(u, "ftp://") {
+			ftpURLs = append(ftpURLs, u)
+			continue
+		}
+		if hasPrefixFold(u, "http://") || hasPrefixFold(u, "https://") {
+			httpURLs = append(httpURLs, u)
+		}
+	}
+	return httpURLs, ftpURLs
 }
 
 // MediaProbe fetches an HLS/DASH manifest and returns selectable variants.
@@ -666,7 +884,11 @@ func (rt *Runtime) MediaProbe(req AddRequest) (*job.ProbeResult, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return job.Probe(ctx, u, h)
+	proxy, err := netx.NormalizeProxy(req.Proxy)
+	if err != nil {
+		return nil, err
+	}
+	return job.Probe(ctx, u, h, proxy)
 }
 
 // MediaStart creates an HLS/DASH task for the selected variant.
@@ -1044,7 +1266,31 @@ func (rt *Runtime) handle(_ context.Context, req ipc.Request) ipc.Response {
 			return ipc.Fail(req.ID, ipc.ErrInternal, err.Error(), nil)
 		}
 		return ipc.OK(req.ID, out)
-	case ipc.MethodGrabEnqueue, ipc.MethodBatchAdd:
+	case ipc.MethodBatchAdd:
+		// Bulk submission from the extension ("scan page for download links").
+		// Submitted URLs already passed the extension's own classifier, and
+		// addMany re-validates each one, so this stays consistent with the
+		// single-download path.
+		var p BatchAddRequest
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return ipc.Fail(req.ID, ipc.ErrInvalidParams, "invalid params", nil)
+		}
+		urls := p.URLs
+		if len(urls) == 0 && strings.TrimSpace(p.Text) != "" {
+			urls = strings.Fields(p.Text)
+		}
+		if len(urls) == 0 {
+			return ipc.Fail(req.ID, ipc.ErrInvalidParams, "urls required", nil)
+		}
+		out := rt.addMany(urls, p.Dir, p.Conns)
+		if out.Added == nil && out.Skipped == 0 && len(out.Failures) == 0 {
+			return ipc.Fail(req.ID, ipc.ErrInvalidParams, "no valid urls", nil)
+		}
+		rt.showWindow()
+		return ipc.OK(req.ID, out)
+	case ipc.MethodGrabEnqueue:
+		// Site-grab enqueue stays desktop-confirmed: it writes into whatever
+		// directory the crawl produced and should be reviewed by the user.
 		return ipc.Fail(req.ID, ipc.ErrForbidden, "请在 XDL 桌面端确认后入队", nil)
 	default:
 		return ipc.Fail(req.ID, ipc.ErrNoMethod, "unknown method: "+req.Method, nil)
@@ -1052,7 +1298,7 @@ func (rt *Runtime) handle(_ context.Context, req ipc.Request) ipc.Response {
 }
 
 func safeURL(u string) bool {
-	return len(u) >= 7 && (hasPrefixFold(u, "http://") || hasPrefixFold(u, "https://") || hasPrefixFold(u, "magnet:"))
+	return len(u) >= 7 && (hasPrefixFold(u, "http://") || hasPrefixFold(u, "https://") || hasPrefixFold(u, "ftp://") || hasPrefixFold(u, "magnet:"))
 }
 
 func hasPrefixFold(s, p string) bool {

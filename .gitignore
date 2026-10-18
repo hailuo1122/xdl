@@ -42,3 +42,10 @@ Thumbs.db
 
 # Wails
 /build/windows/nsis/
+
+# Installer staging / preview captures
+/build/stage/
+/cmd/setup/preview-*.png
+/cmd/setup/payload.stub.zip
+/cmd/setup/ui/node_modules/
+/cmd/setup/ui/dist/

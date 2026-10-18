@@ -80,10 +80,33 @@ export default function PopupApp() {
 
   useEffect(() => {
     void load(true);
-    const timer = window.setInterval(() => {
-      void load(false);
-    }, 2600);
-    return () => window.clearInterval(timer);
+    // Media is fetched once on open. Every poll used to trigger a full page
+    // scan in the content script, so merely leaving the popup open made the
+    // whole browser slower. Only task progress is genuinely live, and even
+    // that backs off to 10s when nothing is downloading.
+    let cancelled = false;
+    let timer = 0;
+    const activeStates = new Set(["running", "queued", "resolving", "verifying"]);
+
+    const tick = async () => {
+      if (cancelled) return;
+      const anyActive = tasks.some((t) => activeStates.has(t.state));
+      const delay = anyActive ? 2000 : 10000;
+      const res = await bg<{ ok: boolean; tasks?: TaskInfo[]; app?: AppState }>({ type: "tasks.list" });
+      if (cancelled) return;
+      if (res) {
+        setTasks(res.tasks || []);
+        if (res.app) setApp(res.app);
+      }
+      if (!cancelled) timer = window.setTimeout(() => void tick(), delay);
+    };
+
+    timer = window.setTimeout(() => void tick(), 2500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const setMode = async (mode: TakeoverMode) => {
@@ -138,7 +161,7 @@ export default function PopupApp() {
   };
 
   const host = hostText(app);
-  const visibleMedia = useMemo(() => media.filter((c) => c.kind !== "other").slice(0, 4), [media]);
+  const visibleMedia = useMemo(() => media.filter((c) => c.kind !== "other").slice(0, 8), [media]);
   const visibleTasks = tasks.slice(0, 4);
 
   return (
@@ -185,7 +208,11 @@ export default function PopupApp() {
         <div className="section-head">
           <span>接管模式</span>
           <span className="muted">
-            {settings.mode === "smart" ? "点击下载自动交给 XDL" : settings.mode === "ask" ? "每次先询问" : "不接管浏览器下载"}
+            {settings.mode === "smart"
+              ? "点下载直接交给 XDL，失败才回退浏览器"
+              : settings.mode === "ask"
+                ? "每次都会打断并询问。想少点一次，改成「智能」"
+                : "不接管浏览器下载，仍可右键或本页媒体发送"}
           </span>
         </div>
         <div className="segmented">
@@ -236,13 +263,9 @@ export default function PopupApp() {
                   {baseName(c.url) || c.url}
                 </span>
                 <span className="media-size">{formatBytes(c.size)}</span>
-                {c.kind === "video" || c.kind === "audio" ? (
-                  <button className="tiny primary" onClick={() => sendMedia(c)} disabled={busy === c.id}>
-                    {busy === c.id ? "…" : "接收"}
-                  </button>
-                ) : (
-                  <span className="tiny disabled">下一版</span>
-                )}
+                <button className="tiny primary" onClick={() => sendMedia(c)} disabled={busy === c.id}>
+                  {busy === c.id ? "…" : "交给 XDL"}
+                </button>
               </div>
             ))}
           </div>

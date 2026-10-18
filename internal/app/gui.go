@@ -202,6 +202,14 @@ func (s *Service) Resume(id string) error {
 	return s.rt.Mgr.Resume(engine.TaskID(id))
 }
 
+func (s *Service) SetPriority(id string, priority int) error {
+	return s.rt.Mgr.SetPriority(engine.TaskID(id), priority)
+}
+
+func (s *Service) SetLimitBps(id string, bps int64) error {
+	return s.rt.Mgr.SetLimitBps(engine.TaskID(id), bps)
+}
+
 func (s *Service) Remove(id string) error {
 	return s.rt.Mgr.Remove(engine.TaskID(id))
 }

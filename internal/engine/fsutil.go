@@ -102,14 +102,16 @@ func LongPath(p string) string {
 	return abs
 }
 
-// Preallocate truncates the file to size (sparse-friendly, no privilege needed).
+// Preallocate creates/opens the part file and reserves disk for size.
+// On Windows this uses FileAllocationInfo (+ optional SetFileValidData);
+// elsewhere it falls back to Truncate. See prealloc_*.go.
 func Preallocate(path string, size int64) error {
 	f, err := os.OpenFile(LongPath(path), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	return f.Truncate(size)
+	return preallocatePlatform(f, size)
 }
 
 // EnsureDiskSpace checks free space with 5% margin. Returns nil if unknown.
